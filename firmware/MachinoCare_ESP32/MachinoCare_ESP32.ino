@@ -37,10 +37,16 @@ const int daylightOffset_sec = 0;
 
 // Hardware
 const int SW420_PIN = 34;
-const int RELAY_PIN = 5;
+const int RELAY1_PIN = 5;
+const int RELAY2_PIN = 18;
+const int BUTTON_RELAY1_PIN = 32;
+const int BUTTON_RELAY2_PIN = 33;
+const int BUTTON_CALIB_PIN = 27;
 
 // true = no relay cut (safe debugging), false = hard failsafe
 bool debugMode = true;
+bool relay1On = true;
+bool relay2On = true;
 
 MPU6050 mpu;
 BlynkTimer timer;
@@ -92,6 +98,18 @@ unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
 
+// Debounced physical button state tracking
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
+int relay1BtnRawLast = HIGH;
+int relay2BtnRawLast = HIGH;
+int calibBtnRawLast = HIGH;
+int relay1BtnStable = HIGH;
+int relay2BtnStable = HIGH;
+int calibBtnStable = HIGH;
+unsigned long relay1BtnLastChangeMs = 0;
+unsigned long relay2BtnLastChangeMs = 0;
+unsigned long calibBtnLastChangeMs = 0;
+
 // 1 second feature window from 100 ms sensor ticks
 const int WINDOW_SIZE = 10;
 float accWindow[WINDOW_SIZE] = {0};
@@ -107,9 +125,62 @@ const int MODEL_HTTP_TIMEOUT_MS = 2500;
 
 void IRAM_ATTR emergencyKillSwitch() {
   if (!debugMode) {
-    digitalWrite(RELAY_PIN, LOW);
+    digitalWrite(RELAY1_PIN, LOW);
+    digitalWrite(RELAY2_PIN, LOW);
   }
   emergencyTriggered = true;
+}
+
+void applyRelayOutputs() {
+  digitalWrite(RELAY1_PIN, relay1On ? HIGH : LOW);
+  digitalWrite(RELAY2_PIN, relay2On ? HIGH : LOW);
+}
+
+void handlePhysicalButtons() {
+  unsigned long nowMs = millis();
+
+  int r1Raw = digitalRead(BUTTON_RELAY1_PIN);
+  if (r1Raw != relay1BtnRawLast) {
+    relay1BtnRawLast = r1Raw;
+    relay1BtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - relay1BtnLastChangeMs) > BUTTON_DEBOUNCE_MS && r1Raw != relay1BtnStable) {
+    relay1BtnStable = r1Raw;
+    if (relay1BtnStable == LOW) {
+      relay1On = !relay1On;
+      applyRelayOutputs();
+      Serial.print("BTN_RELAY1,");
+      Serial.println(relay1On ? "ON" : "OFF");
+    }
+  }
+
+  int r2Raw = digitalRead(BUTTON_RELAY2_PIN);
+  if (r2Raw != relay2BtnRawLast) {
+    relay2BtnRawLast = r2Raw;
+    relay2BtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - relay2BtnLastChangeMs) > BUTTON_DEBOUNCE_MS && r2Raw != relay2BtnStable) {
+    relay2BtnStable = r2Raw;
+    if (relay2BtnStable == LOW) {
+      relay2On = !relay2On;
+      applyRelayOutputs();
+      Serial.print("BTN_RELAY2,");
+      Serial.println(relay2On ? "ON" : "OFF");
+    }
+  }
+
+  int cRaw = digitalRead(BUTTON_CALIB_PIN);
+  if (cRaw != calibBtnRawLast) {
+    calibBtnRawLast = cRaw;
+    calibBtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - calibBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && cRaw != calibBtnStable) {
+    calibBtnStable = cRaw;
+    if (calibBtnStable == LOW) {
+      bool started = startCalibrationJobOnBackend(calibrationAsNewDevice, "physical_button");
+      Serial.println(started ? "BTN_CALIB,STARTED" : "BTN_CALIB,FAILED");
+    }
+  }
 }
 
 String getTimeString() {
@@ -614,6 +685,18 @@ BLYNK_WRITE(V13) {
   calibrationAsNewDevice = (param.asInt() == 1);
 }
 
+// Blynk switch V14: relay 1 remote control
+BLYNK_WRITE(V14) {
+  relay1On = (param.asInt() == 1);
+  applyRelayOutputs();
+}
+
+// Blynk switch V15: relay 2 remote control
+BLYNK_WRITE(V15) {
+  relay2On = (param.asInt() == 1);
+  applyRelayOutputs();
+}
+
 void readSensorsAndPredict() {
   int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
   mpu.getMotion6(&raw_ax, &raw_ay, &raw_az, &raw_gx, &raw_gy, &raw_gz);
@@ -663,6 +746,8 @@ void updateBlynk() {
   Blynk.virtualWrite(V17, (int)streamFailCount);
   Blynk.virtualWrite(V18, lastStreamHttpCode);
   Blynk.virtualWrite(V19, lastStreamResult);
+  Blynk.virtualWrite(V14, relay1On ? 1 : 0);
+  Blynk.virtualWrite(V15, relay2On ? 1 : 0);
   pushCalibrationToBlynk();
 }
 
@@ -714,8 +799,12 @@ void setup() {
   mpu.initialize();
 
   pinMode(SW420_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(BUTTON_RELAY1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_RELAY2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_CALIB_PIN, INPUT_PULLUP);
+  applyRelayOutputs();
 
   attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, RISING);
 
@@ -736,6 +825,7 @@ void setup() {
   timer.setInterval(100L, readSensorsAndPredict);
   timer.setInterval(1000L, updateBlynk);
   timer.setInterval(1000L, sendStreamToBackend);
+  timer.setInterval(50L, handlePhysicalButtons);
   timer.setInterval(5000L, reportBackendTelemetry);
   timer.setInterval(16000L, updateThingSpeak);
 
