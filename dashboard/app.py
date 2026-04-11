@@ -24,21 +24,52 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
     :root {
         --mc-bg: radial-gradient(circle at 15% 10%, #e9f6ff 0%, #f8f2dc 45%, #f3f9f0 100%);
-        --mc-card: rgba(255, 255, 255, 0.82);
+        --mc-card: rgba(255, 255, 255, 0.94);
         --mc-border: rgba(16, 44, 61, 0.2);
         --mc-healthy: #1b8a5a;
         --mc-alert: #d91e18;
         --mc-ink: #0b1f2a;
         --mc-subtle: #445b68;
+        --mc-sidebar-bg: linear-gradient(180deg, #1f2430 0%, #212634 100%);
+        --mc-sidebar-ink: #f3f6ff;
+        --mc-sidebar-input-bg: #0a1020;
     }
 
-    html, body, [class*="css"] {
+    html, body {
         font-family: 'Space Grotesk', sans-serif;
-        color: var(--mc-ink);
     }
 
-    .stApp {
+    [data-testid="stAppViewContainer"] {
         background: var(--mc-bg);
+    }
+
+    [data-testid="stAppViewContainer"] .main h1,
+    [data-testid="stAppViewContainer"] .main h2,
+    [data-testid="stAppViewContainer"] .main h3,
+    [data-testid="stAppViewContainer"] .main h4,
+    [data-testid="stAppViewContainer"] .main h5,
+    [data-testid="stAppViewContainer"] .main h6,
+    [data-testid="stAppViewContainer"] .main p,
+    [data-testid="stAppViewContainer"] .main span,
+    [data-testid="stAppViewContainer"] .main label,
+    [data-testid="stAppViewContainer"] .main div {
+        color: var(--mc-ink) !important;
+    }
+
+    [data-testid="stSidebar"] {
+        background: var(--mc-sidebar-bg) !important;
+    }
+
+    [data-testid="stSidebar"] * {
+        color: var(--mc-sidebar-ink) !important;
+    }
+
+    [data-testid="stSidebar"] input,
+    [data-testid="stSidebar"] textarea,
+    [data-testid="stSidebar"] [data-baseweb="select"] > div,
+    [data-testid="stSidebar"] [data-baseweb="input"] > div {
+        background: var(--mc-sidebar-input-bg) !important;
+        border-color: rgba(173, 188, 255, 0.22) !important;
     }
 
     .mc-glass {
@@ -47,6 +78,7 @@ st.markdown(
         border-radius: 18px;
         padding: 0.9rem 1rem;
         box-shadow: 0 12px 35px rgba(11, 31, 42, 0.08);
+        color: var(--mc-ink) !important;
     }
 
     .mc-title {
@@ -61,6 +93,7 @@ st.markdown(
         font-size: 1.7rem;
         font-weight: 700;
         line-height: 1.1;
+        color: var(--mc-ink) !important;
     }
 
     .mc-status {
@@ -75,13 +108,13 @@ st.markdown(
 
     .mc-healthy {
         background: rgba(27, 138, 90, 0.14);
-        color: var(--mc-healthy);
+        color: var(--mc-healthy) !important;
         border: 1px solid rgba(27, 138, 90, 0.32);
     }
 
     .mc-anomaly {
         background: rgba(217, 30, 24, 0.13);
-        color: var(--mc-alert);
+        color: var(--mc-alert) !important;
         border: 1px solid rgba(217, 30, 24, 0.32);
     }
 

@@ -1,9 +1,0 @@
-{
-  "$schema": "https://railway.app/railway.schema.json",
-  "deploy": {
-    "startCommand": "python run_all.py",
-    "healthcheckPath": "/api/v1/health",
-    "restartPolicyType": "on_failure",
-    "restartPolicyMaxRetries": 10
-  }
-}
