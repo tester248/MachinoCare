@@ -85,6 +85,13 @@ String calibrationStage = "idle";
 String calibrationMessage = "Idle";
 bool calibrationAsNewDevice = true;
 
+// Backend delivery telemetry
+unsigned long streamAttemptCount = 0;
+unsigned long streamSuccessCount = 0;
+unsigned long streamFailCount = 0;
+int lastStreamHttpCode = 0;
+String lastStreamResult = "INIT";
+
 // 1 second feature window from 100 ms sensor ticks
 const int WINDOW_SIZE = 10;
 float accWindow[WINDOW_SIZE] = {0};
@@ -236,8 +243,17 @@ bool evaluateLocalAI() {
   return anomaly;
 }
 
-bool httpPostJson(const String& url, const String& payload, String& responseOut, int timeoutMs) {
+bool httpPostJson(
+  const String& url,
+  const String& payload,
+  String& responseOut,
+  int timeoutMs,
+  int* statusCodeOut = nullptr
+) {
   if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
+    if (statusCodeOut != nullptr) {
+      *statusCodeOut = -1;
+    }
     return false;
   }
 
@@ -245,6 +261,9 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
   apiClient.setInsecure();
 
   if (!http.begin(apiClient, url)) {
+    if (statusCodeOut != nullptr) {
+      *statusCodeOut = -2;
+    }
     return false;
   }
 
@@ -253,6 +272,9 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
   http.addHeader("Content-Type", "application/json");
 
   int code = http.POST(payload);
+  if (statusCodeOut != nullptr) {
+    *statusCodeOut = code;
+  }
   if (code > 0) {
     responseOut = http.getString();
   }
@@ -261,8 +283,11 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
   return (code >= 200 && code < 300);
 }
 
-bool httpGetJson(const String& url, String& responseOut, int timeoutMs) {
+bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
   if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
+    if (statusCodeOut != nullptr) {
+      *statusCodeOut = -1;
+    }
     return false;
   }
 
@@ -270,6 +295,9 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs) {
   apiClient.setInsecure();
 
   if (!http.begin(apiClient, url)) {
+    if (statusCodeOut != nullptr) {
+      *statusCodeOut = -2;
+    }
     return false;
   }
 
@@ -277,6 +305,9 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs) {
   http.setTimeout(timeoutMs);
 
   int code = http.GET();
+  if (statusCodeOut != nullptr) {
+    *statusCodeOut = code;
+  }
   if (code > 0) {
     responseOut = http.getString();
   }
@@ -511,6 +542,8 @@ void sendStreamToBackend() {
   if (!backendEnabled) return;
   if (emergencyTriggered && !debugMode) return;
 
+  streamAttemptCount++;
+
   StaticJsonDocument<512> req;
   req["machine_id"] = MACHINE_ID;
   req["device_id"] = DEVICE_ID;
@@ -529,9 +562,35 @@ void sendStreamToBackend() {
 
   String response;
   String url = String(BACKEND_BASE_URL) + "/api/v1/stream";
-  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS)) {
+  int httpCode = 0;
+  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
+    streamFailCount++;
+    lastStreamHttpCode = httpCode;
+    if (httpCode == -1) {
+      lastStreamResult = "FAIL: WIFI_DOWN";
+    } else if (httpCode == -2) {
+      lastStreamResult = "FAIL: HTTP_BEGIN";
+    } else {
+      lastStreamResult = "FAIL: HTTP_" + String(httpCode);
+    }
+
+    Serial.print("STREAM_FAIL,code=");
+    Serial.print(httpCode);
+    Serial.print(",wifi=");
+    Serial.println(WiFi.status());
     return;
   }
+
+  streamSuccessCount++;
+  lastStreamHttpCode = httpCode;
+  lastStreamResult = "OK";
+
+  Serial.print("STREAM_OK,code=");
+  Serial.print(httpCode);
+  Serial.print(",attempt=");
+  Serial.print(streamAttemptCount);
+  Serial.print(",success=");
+  Serial.println(streamSuccessCount);
 
   DynamicJsonDocument doc(2048);
   if (deserializeJson(doc, response) == DeserializationError::Ok) {
@@ -600,7 +659,24 @@ void updateBlynk() {
   Blynk.virtualWrite(V5, sw420val);
   Blynk.virtualWrite(V6, getTimeString());
   Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
+  Blynk.virtualWrite(V16, (int)streamSuccessCount);
+  Blynk.virtualWrite(V17, (int)streamFailCount);
+  Blynk.virtualWrite(V18, lastStreamHttpCode);
+  Blynk.virtualWrite(V19, lastStreamResult);
   pushCalibrationToBlynk();
+}
+
+void reportBackendTelemetry() {
+  Serial.print("STREAM_STATS,attempt=");
+  Serial.print(streamAttemptCount);
+  Serial.print(",success=");
+  Serial.print(streamSuccessCount);
+  Serial.print(",fail=");
+  Serial.print(streamFailCount);
+  Serial.print(",lastCode=");
+  Serial.print(lastStreamHttpCode);
+  Serial.print(",lastResult=");
+  Serial.println(lastStreamResult);
 }
 
 void updateThingSpeak() {
@@ -660,6 +736,7 @@ void setup() {
   timer.setInterval(100L, readSensorsAndPredict);
   timer.setInterval(1000L, updateBlynk);
   timer.setInterval(1000L, sendStreamToBackend);
+  timer.setInterval(5000L, reportBackendTelemetry);
   timer.setInterval(16000L, updateThingSpeak);
 
   // Backend sync
