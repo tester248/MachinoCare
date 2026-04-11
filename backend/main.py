@@ -9,6 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 
 from backend.ml_engine import (
     FEATURE_ORDER,
@@ -53,6 +54,11 @@ router = APIRouter()
 
 calibration_jobs: dict[str, dict[str, Any]] = {}
 calibration_jobs_lock = threading.Lock()
+
+
+@app.get("/", include_in_schema=False)
+def root() -> RedirectResponse:
+    return RedirectResponse(url="/docs", status_code=307)
 
 
 def utc_iso_now() -> str:
