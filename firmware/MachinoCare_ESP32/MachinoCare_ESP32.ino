@@ -1,5 +1,7 @@
 // ============================================================
-// MachinoCare - Final Firmware (AI + Failsafe + Cloud + Backend)
+// MachinoCare - Final Firmware (MERGED)
+// AI + Failsafe + Cloud + Backend + 2 Relays + 3 Buttons
+// + Stream telemetry + remote relay control + debug prints
 // ============================================================
 
 #define BLYNK_TEMPLATE_ID   "TMPL3LJfoU1on"
@@ -24,8 +26,8 @@ unsigned long TS_CHANNEL_ID = 3336916;
 const char* TS_WRITE_KEY = "REPLACE_WITH_THINGSPEAK_WRITE_KEY";
 WiFiClient tsClient;
 
-// Backend settings (Railway URL)
-const char* BACKEND_BASE_URL = "https://REPLACE_WITH_RAILWAY_DOMAIN.up.railway.app";
+// Backend settings
+const char* BACKEND_BASE_URL = "https://REPLACE_WITH_BACKEND_DOMAIN";
 const char* MACHINE_ID = "Fan_1";
 const char* DEVICE_ID = "esp32_fan_1";
 bool backendEnabled = true;
@@ -35,18 +37,20 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 const int daylightOffset_sec = 0;
 
-// Hardware
+// Hardware pins (your current mapping)
 const int SW420_PIN = 34;
-const int RELAY1_PIN = 5;
-const int RELAY2_PIN = 18;
-const int BUTTON_RELAY1_PIN = 32;
-const int BUTTON_RELAY2_PIN = 33;
-const int BUTTON_CALIB_PIN = 27;
+const int RELAY_MOTOR_PIN = 25;
+const int RELAY_FAN_PIN   = 26;
+const int BTN_MOTOR_PIN   = 18;
+const int BTN_FAN_PIN     = 19;
+const int BTN_CALIB_PIN   = 23;
+
+// Relay polarity (active LOW board)
+const int RELAY_ON  = LOW;
+const int RELAY_OFF = HIGH;
 
 // true = no relay cut (safe debugging), false = hard failsafe
-bool debugMode = true;
-bool relay1On = true;
-bool relay2On = true;
+volatile bool debugMode = true;
 
 MPU6050 mpu;
 BlynkTimer timer;
@@ -57,18 +61,20 @@ float accMag = 0;
 float gyroMag = 0;
 int gx = 0, gy = 0, gz = 0;
 
-// Fallback threshold on raw acceleration magnitude
 float aiThreshold = 25000.0;
-
 volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
+
+// Relay states
+bool motorOn = true;
+bool fanOn   = true;
 
 // ThingSpeak window stats
 float accSum = 0;
 float accPeak = 0;
 int sampleCount = 0;
 
-// Lightweight edge model package (distilled from backend)
+// Lightweight edge model
 const int FEATURE_DIM = 8;
 float featureMeans[FEATURE_DIM] = {0};
 float featureStds[FEATURE_DIM] = {1, 1, 1, 1, 1, 1, 1, 1};
@@ -83,7 +89,7 @@ String modelChecksum = "";
 bool modelReady = false;
 int anomalyStreak = 0;
 
-// Calibration job tracking (from backend)
+// Calibration tracking
 String calibrationJobId = "";
 bool calibrationInProgress = false;
 int calibrationProgress = 0;
@@ -91,26 +97,26 @@ String calibrationStage = "idle";
 String calibrationMessage = "Idle";
 bool calibrationAsNewDevice = true;
 
-// Backend delivery telemetry
+// Backend stream telemetry
 unsigned long streamAttemptCount = 0;
 unsigned long streamSuccessCount = 0;
 unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
 
-// Debounced physical button state tracking
+// Debounced buttons
 const unsigned long BUTTON_DEBOUNCE_MS = 40;
-int relay1BtnRawLast = HIGH;
-int relay2BtnRawLast = HIGH;
+int motorBtnRawLast = HIGH;
+int fanBtnRawLast = HIGH;
 int calibBtnRawLast = HIGH;
-int relay1BtnStable = HIGH;
-int relay2BtnStable = HIGH;
+int motorBtnStable = HIGH;
+int fanBtnStable = HIGH;
 int calibBtnStable = HIGH;
-unsigned long relay1BtnLastChangeMs = 0;
-unsigned long relay2BtnLastChangeMs = 0;
+unsigned long motorBtnLastChangeMs = 0;
+unsigned long fanBtnLastChangeMs = 0;
 unsigned long calibBtnLastChangeMs = 0;
 
-// 1 second feature window from 100 ms sensor ticks
+// 1 second feature window (100ms ticks)
 const int WINDOW_SIZE = 10;
 float accWindow[WINDOW_SIZE] = {0};
 float gyroWindow[WINDOW_SIZE] = {0};
@@ -123,64 +129,44 @@ int windowCount = 0;
 const int STREAM_HTTP_TIMEOUT_MS = 1400;
 const int MODEL_HTTP_TIMEOUT_MS = 2500;
 
+void applyRelays() {
+  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
+}
+
+void updateCalibrationRuntime(const String& stage, int progress, const String& message, bool inProgress) {
+  calibrationStage = stage;
+  calibrationProgress = progress;
+  calibrationMessage = message;
+  calibrationInProgress = inProgress;
+}
+
+void resetRuntimeForFreshCalibration() {
+  accSum = 0;
+  accPeak = 0;
+  sampleCount = 0;
+  anomalyStreak = 0;
+  isMachineFailing = false;
+
+  for (int i = 0; i < WINDOW_SIZE; i++) {
+    accWindow[i] = 0;
+    gyroWindow[i] = 0;
+    gxWindow[i] = 0;
+    gyWindow[i] = 0;
+    gzWindow[i] = 0;
+  }
+  windowPos = 0;
+  windowCount = 0;
+
+  updateCalibrationRuntime("queued", 1, "Manual reset: starting new calibration", true);
+}
+
 void IRAM_ATTR emergencyKillSwitch() {
   if (!debugMode) {
-    digitalWrite(RELAY1_PIN, LOW);
-    digitalWrite(RELAY2_PIN, LOW);
+    digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
+    digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
   }
   emergencyTriggered = true;
-}
-
-void applyRelayOutputs() {
-  digitalWrite(RELAY1_PIN, relay1On ? HIGH : LOW);
-  digitalWrite(RELAY2_PIN, relay2On ? HIGH : LOW);
-}
-
-void handlePhysicalButtons() {
-  unsigned long nowMs = millis();
-
-  int r1Raw = digitalRead(BUTTON_RELAY1_PIN);
-  if (r1Raw != relay1BtnRawLast) {
-    relay1BtnRawLast = r1Raw;
-    relay1BtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - relay1BtnLastChangeMs) > BUTTON_DEBOUNCE_MS && r1Raw != relay1BtnStable) {
-    relay1BtnStable = r1Raw;
-    if (relay1BtnStable == LOW) {
-      relay1On = !relay1On;
-      applyRelayOutputs();
-      Serial.print("BTN_RELAY1,");
-      Serial.println(relay1On ? "ON" : "OFF");
-    }
-  }
-
-  int r2Raw = digitalRead(BUTTON_RELAY2_PIN);
-  if (r2Raw != relay2BtnRawLast) {
-    relay2BtnRawLast = r2Raw;
-    relay2BtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - relay2BtnLastChangeMs) > BUTTON_DEBOUNCE_MS && r2Raw != relay2BtnStable) {
-    relay2BtnStable = r2Raw;
-    if (relay2BtnStable == LOW) {
-      relay2On = !relay2On;
-      applyRelayOutputs();
-      Serial.print("BTN_RELAY2,");
-      Serial.println(relay2On ? "ON" : "OFF");
-    }
-  }
-
-  int cRaw = digitalRead(BUTTON_CALIB_PIN);
-  if (cRaw != calibBtnRawLast) {
-    calibBtnRawLast = cRaw;
-    calibBtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - calibBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && cRaw != calibBtnStable) {
-    calibBtnStable = cRaw;
-    if (calibBtnStable == LOW) {
-      bool started = startCalibrationJobOnBackend(calibrationAsNewDevice, "physical_button");
-      Serial.println(started ? "BTN_CALIB,STARTED" : "BTN_CALIB,FAILED");
-    }
-  }
 }
 
 String getTimeString() {
@@ -199,24 +185,18 @@ void pushWindowSample(float aMag, float gMag, float x, float y, float z) {
   gzWindow[windowPos] = z;
 
   windowPos = (windowPos + 1) % WINDOW_SIZE;
-  if (windowCount < WINDOW_SIZE) {
-    windowCount++;
-  }
+  if (windowCount < WINDOW_SIZE) windowCount++;
 }
 
 int orderedIndex(int logicalIdx) {
-  if (windowCount < WINDOW_SIZE) {
-    return logicalIdx;
-  }
+  if (windowCount < WINDOW_SIZE) return logicalIdx;
   return (windowPos + logicalIdx) % WINDOW_SIZE;
 }
 
 float meanOf(float* arr, int n) {
   if (n <= 0) return 0.0;
   float s = 0.0;
-  for (int i = 0; i < n; i++) {
-    s += arr[orderedIndex(i)];
-  }
+  for (int i = 0; i < n; i++) s += arr[orderedIndex(i)];
   return s / n;
 }
 
@@ -241,9 +221,7 @@ float maxOf(float* arr, int n) {
 }
 
 bool computeFeatureVector(float outFeatures[FEATURE_DIM]) {
-  if (windowCount <= 1) {
-    return false;
-  }
+  if (windowCount <= 1) return false;
 
   float meanAcc = meanOf(accWindow, windowCount);
   float stdAcc = stdOf(accWindow, windowCount, meanAcc);
@@ -287,22 +265,15 @@ float scoreDistilledModel(float features[FEATURE_DIM]) {
 }
 
 bool evaluateLocalAI() {
-  if (!modelReady) {
-    return accMag > aiThreshold;
-  }
+  if (!modelReady) return accMag > aiThreshold;
 
   float features[FEATURE_DIM] = {0};
-  if (!computeFeatureVector(features)) {
-    return accMag > aiThreshold;
-  }
+  if (!computeFeatureVector(features)) return accMag > aiThreshold;
 
   float score = scoreDistilledModel(features);
 
-  if (score >= modelHysteresisHigh) {
-    anomalyStreak++;
-  } else if (score < modelHysteresisLow) {
-    anomalyStreak = 0;
-  }
+  if (score >= modelHysteresisHigh) anomalyStreak++;
+  else if (score < modelHysteresisLow) anomalyStreak = 0;
 
   bool anomaly = anomalyStreak >= modelMinConsecutiveWindows;
 
@@ -314,17 +285,9 @@ bool evaluateLocalAI() {
   return anomaly;
 }
 
-bool httpPostJson(
-  const String& url,
-  const String& payload,
-  String& responseOut,
-  int timeoutMs,
-  int* statusCodeOut = nullptr
-) {
+bool httpPostJson(const String& url, const String& payload, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
   if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
-    if (statusCodeOut != nullptr) {
-      *statusCodeOut = -1;
-    }
+    if (statusCodeOut) *statusCodeOut = -1;
     return false;
   }
 
@@ -332,9 +295,7 @@ bool httpPostJson(
   apiClient.setInsecure();
 
   if (!http.begin(apiClient, url)) {
-    if (statusCodeOut != nullptr) {
-      *statusCodeOut = -2;
-    }
+    if (statusCodeOut) *statusCodeOut = -2;
     return false;
   }
 
@@ -343,12 +304,8 @@ bool httpPostJson(
   http.addHeader("Content-Type", "application/json");
 
   int code = http.POST(payload);
-  if (statusCodeOut != nullptr) {
-    *statusCodeOut = code;
-  }
-  if (code > 0) {
-    responseOut = http.getString();
-  }
+  if (statusCodeOut) *statusCodeOut = code;
+  if (code > 0) responseOut = http.getString();
 
   http.end();
   return (code >= 200 && code < 300);
@@ -356,9 +313,7 @@ bool httpPostJson(
 
 bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
   if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
-    if (statusCodeOut != nullptr) {
-      *statusCodeOut = -1;
-    }
+    if (statusCodeOut) *statusCodeOut = -1;
     return false;
   }
 
@@ -366,9 +321,7 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
   apiClient.setInsecure();
 
   if (!http.begin(apiClient, url)) {
-    if (statusCodeOut != nullptr) {
-      *statusCodeOut = -2;
-    }
+    if (statusCodeOut) *statusCodeOut = -2;
     return false;
   }
 
@@ -376,12 +329,8 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
   http.setTimeout(timeoutMs);
 
   int code = http.GET();
-  if (statusCodeOut != nullptr) {
-    *statusCodeOut = code;
-  }
-  if (code > 0) {
-    responseOut = http.getString();
-  }
+  if (statusCodeOut) *statusCodeOut = code;
+  if (code > 0) responseOut = http.getString();
 
   http.end();
   return (code >= 200 && code < 300);
@@ -431,17 +380,13 @@ void loadModelFromNvs() {
 }
 
 bool applyModelPackage(JsonObject pkg) {
-  if (!pkg.containsKey("feature_means") || !pkg.containsKey("feature_stds") || !pkg.containsKey("weights")) {
-    return false;
-  }
+  if (!pkg.containsKey("feature_means") || !pkg.containsKey("feature_stds") || !pkg.containsKey("weights")) return false;
 
   JsonArray means = pkg["feature_means"].as<JsonArray>();
-  JsonArray stds = pkg["feature_stds"].as<JsonArray>();
-  JsonArray wts = pkg["weights"].as<JsonArray>();
+  JsonArray stds  = pkg["feature_stds"].as<JsonArray>();
+  JsonArray wts   = pkg["weights"].as<JsonArray>();
 
-  if (means.size() != FEATURE_DIM || stds.size() != FEATURE_DIM || wts.size() != FEATURE_DIM) {
-    return false;
-  }
+  if (means.size() != FEATURE_DIM || stds.size() != FEATURE_DIM || wts.size() != FEATURE_DIM) return false;
 
   for (int i = 0; i < FEATURE_DIM; i++) {
     featureMeans[i] = means[i].as<float>();
@@ -453,7 +398,7 @@ bool applyModelPackage(JsonObject pkg) {
   modelBias = pkg["bias"] | 0.0;
   modelDecisionThreshold = pkg["decision_threshold"] | 0.55;
   modelHysteresisHigh = pkg["hysteresis_high"] | modelDecisionThreshold;
-  modelHysteresisLow = pkg["hysteresis_low"] | (modelDecisionThreshold * 0.9);
+  modelHysteresisLow  = pkg["hysteresis_low"] | (modelDecisionThreshold * 0.9);
   modelMinConsecutiveWindows = pkg["min_consecutive_windows"] | 3;
   modelVersion = pkg["model_version"] | modelVersion;
   modelChecksum = String((const char*)(pkg["checksum"] | ""));
@@ -467,13 +412,6 @@ bool applyModelPackage(JsonObject pkg) {
   return true;
 }
 
-void updateCalibrationRuntime(const String& stage, int progress, const String& message, bool inProgress) {
-  calibrationStage = stage;
-  calibrationProgress = progress;
-  calibrationMessage = message;
-  calibrationInProgress = inProgress;
-}
-
 void pushCalibrationToBlynk() {
   Blynk.virtualWrite(V10, calibrationStage + " | " + calibrationMessage);
   Blynk.virtualWrite(V11, calibrationProgress);
@@ -482,12 +420,8 @@ void pushCalibrationToBlynk() {
 }
 
 bool startCalibrationJobOnBackend(bool newDeviceSetup, const char* triggerSource) {
-  if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
-    return false;
-  }
-  if (calibrationInProgress) {
-    return true;
-  }
+  if (!backendEnabled || WiFi.status() != WL_CONNECTED) return false;
+  if (calibrationInProgress) return true;
 
   StaticJsonDocument<768> req;
   req["machine_id"] = MACHINE_ID;
@@ -523,25 +457,19 @@ bool startCalibrationJobOnBackend(bool newDeviceSetup, const char* triggerSource
   }
 
   updateCalibrationRuntime("queued", 1, "New device training queued", true);
-  Blynk.logEvent("machine_alert", "Calibration started for device setup");
+  Blynk.logEvent("machine_alert", "Calibration started");
   return true;
 }
 
 void pollCalibrationJobStatus() {
-  if (!backendEnabled) return;
-  if (!calibrationInProgress) return;
-  if (calibrationJobId.length() == 0) return;
+  if (!backendEnabled || !calibrationInProgress || calibrationJobId.length() == 0) return;
 
   String response;
   String url = String(BACKEND_BASE_URL) + "/api/v1/calibrate/status/" + calibrationJobId;
-  if (!httpGetJson(url, response, MODEL_HTTP_TIMEOUT_MS)) {
-    return;
-  }
+  if (!httpGetJson(url, response, MODEL_HTTP_TIMEOUT_MS)) return;
 
   DynamicJsonDocument doc(16384);
-  if (deserializeJson(doc, response) != DeserializationError::Ok) {
-    return;
-  }
+  if (deserializeJson(doc, response) != DeserializationError::Ok) return;
 
   String status = String((const char*)(doc["status"] | "unknown"));
   String stage = String((const char*)(doc["stage"] | "unknown"));
@@ -555,7 +483,7 @@ void pollCalibrationJobStatus() {
     JsonObject pkg = result["model_package"].as<JsonObject>();
     if (!pkg.isNull() && applyModelPackage(pkg)) {
       updateCalibrationRuntime("completed", 100, "Weights applied to device", false);
-      Blynk.logEvent("machine_alert", "Calibration completed and weights applied");
+      Blynk.logEvent("machine_alert", "Calibration completed");
     } else {
       updateCalibrationRuntime("failed", 100, "Model package apply failed", false);
     }
@@ -582,8 +510,7 @@ void pullModelPackageFromBackend() {
   }
 
   DynamicJsonDocument doc(8192);
-  DeserializationError err = deserializeJson(doc, response);
-  if (err) {
+  if (deserializeJson(doc, response) != DeserializationError::Ok) {
     Serial.println("Model JSON parse error");
     return;
   }
@@ -595,9 +522,7 @@ void pullModelPackageFromBackend() {
   }
 
   int incomingVersion = pkg["model_version"] | 0;
-  if (incomingVersion < modelVersion) {
-    return;
-  }
+  if (incomingVersion < modelVersion) return;
 
   if (applyModelPackage(pkg)) {
     Serial.print("Model package applied, version=");
@@ -637,13 +562,9 @@ void sendStreamToBackend() {
   if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
     streamFailCount++;
     lastStreamHttpCode = httpCode;
-    if (httpCode == -1) {
-      lastStreamResult = "FAIL: WIFI_DOWN";
-    } else if (httpCode == -2) {
-      lastStreamResult = "FAIL: HTTP_BEGIN";
-    } else {
-      lastStreamResult = "FAIL: HTTP_" + String(httpCode);
-    }
+    if (httpCode == -1) lastStreamResult = "FAIL: WIFI_DOWN";
+    else if (httpCode == -2) lastStreamResult = "FAIL: HTTP_BEGIN";
+    else lastStreamResult = "FAIL: HTTP_" + String(httpCode);
 
     Serial.print("STREAM_FAIL,code=");
     Serial.print(httpCode);
@@ -685,16 +606,83 @@ BLYNK_WRITE(V13) {
   calibrationAsNewDevice = (param.asInt() == 1);
 }
 
-// Blynk switch V14: relay 1 remote control
+// Blynk switch V14: motor relay remote control
 BLYNK_WRITE(V14) {
-  relay1On = (param.asInt() == 1);
-  applyRelayOutputs();
+  motorOn = (param.asInt() == 1);
+  applyRelays();
 }
 
-// Blynk switch V15: relay 2 remote control
+// Blynk switch V15: fan relay remote control
 BLYNK_WRITE(V15) {
-  relay2On = (param.asInt() == 1);
-  applyRelayOutputs();
+  fanOn = (param.asInt() == 1);
+  applyRelays();
+}
+
+void debugCalibButtonRaw() {
+  static unsigned long last = 0;
+  if (millis() - last >= 300) {
+    last = millis();
+    Serial.print("RAW CALIB BTN = ");
+    Serial.println(digitalRead(BTN_CALIB_PIN)); // 1 idle, 0 pressed
+  }
+}
+
+// Debounced physical button handler
+void handlePhysicalButtons() {
+  if (emergencyTriggered && !debugMode) return;
+
+  unsigned long nowMs = millis();
+
+  int mRaw = digitalRead(BTN_MOTOR_PIN);
+  if (mRaw != motorBtnRawLast) {
+    motorBtnRawLast = mRaw;
+    motorBtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - motorBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && mRaw != motorBtnStable) {
+    motorBtnStable = mRaw;
+    if (motorBtnStable == LOW) {
+      motorOn = !motorOn;
+      applyRelays();
+      Serial.print("BTN_MOTOR,");
+      Serial.println(motorOn ? "ON" : "OFF");
+    }
+  }
+
+  int fRaw = digitalRead(BTN_FAN_PIN);
+  if (fRaw != fanBtnRawLast) {
+    fanBtnRawLast = fRaw;
+    fanBtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - fanBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && fRaw != fanBtnStable) {
+    fanBtnStable = fRaw;
+    if (fanBtnStable == LOW) {
+      fanOn = !fanOn;
+      applyRelays();
+      Serial.print("BTN_FAN,");
+      Serial.println(fanOn ? "ON" : "OFF");
+    }
+  }
+
+  int cRaw = digitalRead(BTN_CALIB_PIN);
+  if (cRaw != calibBtnRawLast) {
+    calibBtnRawLast = cRaw;
+    calibBtnLastChangeMs = nowMs;
+  }
+  if ((nowMs - calibBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && cRaw != calibBtnStable) {
+    calibBtnStable = cRaw;
+    if (calibBtnStable == LOW) {
+      Serial.println("================================================");
+      Serial.println("CALIB BUTTON PRESSED");
+      Serial.print("Time: ");
+      Serial.println(getTimeString());
+      Serial.println("Action: Reset runtime + start new-device calibration");
+      Serial.println("================================================");
+
+      resetRuntimeForFreshCalibration();
+      bool started = startCalibrationJobOnBackend(calibrationAsNewDevice, "physical_button");
+      Serial.println(started ? "BTN_CALIB,STARTED" : "BTN_CALIB,FAILED");
+    }
+  }
 }
 
 void readSensorsAndPredict() {
@@ -742,12 +730,17 @@ void updateBlynk() {
   Blynk.virtualWrite(V5, sw420val);
   Blynk.virtualWrite(V6, getTimeString());
   Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
+
+  // relay states
+  Blynk.virtualWrite(V14, motorOn ? 1 : 0);
+  Blynk.virtualWrite(V15, fanOn ? 1 : 0);
+
+  // backend stream telemetry
   Blynk.virtualWrite(V16, (int)streamSuccessCount);
   Blynk.virtualWrite(V17, (int)streamFailCount);
   Blynk.virtualWrite(V18, lastStreamHttpCode);
   Blynk.virtualWrite(V19, lastStreamResult);
-  Blynk.virtualWrite(V14, relay1On ? 1 : 0);
-  Blynk.virtualWrite(V15, relay2On ? 1 : 0);
+
   pushCalibrationToBlynk();
 }
 
@@ -768,9 +761,7 @@ void updateThingSpeak() {
   if (emergencyTriggered && !debugMode) return;
 
   float accAvg = 0;
-  if (sampleCount > 0) {
-    accAvg = accSum / sampleCount;
-  }
+  if (sampleCount > 0) accAvg = accSum / sampleCount;
 
   int sw420val = digitalRead(SW420_PIN);
 
@@ -799,20 +790,21 @@ void setup() {
   mpu.initialize();
 
   pinMode(SW420_PIN, INPUT);
-  pinMode(RELAY1_PIN, OUTPUT);
-  pinMode(RELAY2_PIN, OUTPUT);
-  pinMode(BUTTON_RELAY1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_RELAY2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_CALIB_PIN, INPUT_PULLUP);
-  applyRelayOutputs();
+  pinMode(RELAY_MOTOR_PIN, OUTPUT);
+  pinMode(RELAY_FAN_PIN, OUTPUT);
+
+  pinMode(BTN_MOTOR_PIN, INPUT_PULLUP);
+  pinMode(BTN_FAN_PIN, INPUT_PULLUP);
+  pinMode(BTN_CALIB_PIN, INPUT_PULLUP);
+
+  motorOn = true;
+  fanOn = true;
+  applyRelays();
 
   attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, RISING);
 
-  if (debugMode) {
-    Serial.println("DEBUG MODE ON: relay kill disabled");
-  } else {
-    Serial.println("PRODUCTION MODE: relay kill armed");
-  }
+  if (debugMode) Serial.println("DEBUG MODE ON: relay kill disabled");
+  else Serial.println("PRODUCTION MODE: relay kill armed");
 
   Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
   ThingSpeak.begin(tsClient);
@@ -821,27 +813,30 @@ void setup() {
   loadModelFromNvs();
   updateCalibrationRuntime("idle", 0, "Ready", false);
 
-  // Fast sensor loop + cloud loops
+  timer.setInterval(50L, handlePhysicalButtons);
   timer.setInterval(100L, readSensorsAndPredict);
   timer.setInterval(1000L, updateBlynk);
   timer.setInterval(1000L, sendStreamToBackend);
-  timer.setInterval(50L, handlePhysicalButtons);
   timer.setInterval(5000L, reportBackendTelemetry);
   timer.setInterval(16000L, updateThingSpeak);
 
-  // Backend sync
   timer.setTimeout(15000L, pullModelPackageFromBackend);
-  timer.setInterval(300000L, pullModelPackageFromBackend);      // every 5 min
-  timer.setInterval(1800000L, requestCalibrationFromBackend);   // every 30 min
-  timer.setInterval(2000L, pollCalibrationJobStatus);           // every 2 sec
+  timer.setInterval(300000L, pullModelPackageFromBackend);      // 5 min
+  timer.setInterval(1800000L, requestCalibrationFromBackend);   // 30 min
+  timer.setInterval(2000L, pollCalibrationJobStatus);           // 2 sec
 }
 
 void loop() {
   if (emergencyTriggered) {
     if (!debugMode) {
+      motorOn = false;
+      fanOn = false;
+      applyRelays();
+
       Blynk.logEvent("critical_failure", "SW-420 hardware kill switch activated");
       Serial.println("EMERGENCY SHUTDOWN: system locked");
       Blynk.virtualWrite(V5, 1);
+
       while (true) {
         delay(1000);
       }
@@ -851,6 +846,7 @@ void loop() {
     }
   }
 
+  debugCalibButtonRaw();
   Blynk.run();
   timer.run();
 }

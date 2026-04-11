@@ -7,7 +7,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 
 API_DEFAULT = os.getenv("MACHINOCARE_API_URL", "http://localhost:8000")
 THINGSPEAK_CHANNEL_DEFAULT = os.getenv("MACHINOCARE_THINGSPEAK_CHANNEL", "3336916")
@@ -39,21 +38,13 @@ st.markdown(
         font-family: 'Space Grotesk', sans-serif;
     }
 
-    [data-testid="stAppViewContainer"] {
-        background: var(--mc-bg);
+    [data-testid="stStatusWidget"] {
+        visibility: hidden;
+        height: 0;
     }
 
-    [data-testid="stAppViewContainer"] .main h1,
-    [data-testid="stAppViewContainer"] .main h2,
-    [data-testid="stAppViewContainer"] .main h3,
-    [data-testid="stAppViewContainer"] .main h4,
-    [data-testid="stAppViewContainer"] .main h5,
-    [data-testid="stAppViewContainer"] .main h6,
-    [data-testid="stAppViewContainer"] .main p,
-    [data-testid="stAppViewContainer"] .main span,
-    [data-testid="stAppViewContainer"] .main label,
-    [data-testid="stAppViewContainer"] .main div {
-        color: var(--mc-ink) !important;
+    [data-testid="stAppViewContainer"] {
+        background: var(--mc-bg);
     }
 
     [data-testid="stSidebar"] {
@@ -118,13 +109,6 @@ st.markdown(
         border: 1px solid rgba(217, 30, 24, 0.32);
     }
 
-    .mc-job {
-        border-radius: 14px;
-        border: 1px solid rgba(16, 44, 61, 0.18);
-        padding: 0.8rem;
-        background: rgba(255, 255, 255, 0.7);
-    }
-
     code, pre {
         font-family: 'IBM Plex Mono', monospace;
     }
@@ -158,8 +142,9 @@ def thingspeak_history(channel_id: str, results: int = 60) -> tuple[pd.DataFrame
     frame = pd.DataFrame(feeds)
     if "created_at" in frame.columns:
         frame["created_at"] = pd.to_datetime(frame["created_at"], errors="coerce")
-    if "field1" in frame.columns:
-        frame["field1"] = pd.to_numeric(frame["field1"], errors="coerce")
+    for col in ["field1", "field2", "field3", "field4", "field5", "field6"]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
     return frame, None
 
 
@@ -168,7 +153,33 @@ def status_badge(is_anomaly: bool, status_label: str) -> str:
     return f"<span class='mc-status {css_class}'>{status_label}</span>"
 
 
-st_autorefresh(interval=1000, key="machinocare_refresh")
+def normalize_recent_samples(samples: list[dict]) -> pd.DataFrame:
+    if not samples:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(samples)
+    rename_map = {
+        "accMag": "acc_mag",
+        "gyroMag": "gyro_mag",
+        "isAnomaly": "is_anomaly",
+        "decisionThreshold": "decision_threshold",
+        "windowIndex": "window_index",
+    }
+    frame = frame.rename(columns=rename_map)
+
+    if "timestamp" in frame.columns:
+        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
+        frame = frame.dropna(subset=["timestamp"])
+
+    for col in ["acc_mag", "gyro_mag", "gx", "gy", "gz", "sw420", "score", "decision_threshold"]:
+        if col in frame.columns:
+            frame[col] = pd.to_numeric(frame[col], errors="coerce")
+
+    if "is_anomaly" in frame.columns:
+        frame["is_anomaly"] = frame["is_anomaly"].astype(str).str.lower().isin(["1", "true", "yes"])
+
+    return frame
+
 
 if "active_job_id" not in st.session_state:
     st.session_state.active_job_id = None
@@ -176,6 +187,8 @@ if "active_job_machine" not in st.session_state:
     st.session_state.active_job_machine = None
 if "active_job_device" not in st.session_state:
     st.session_state.active_job_device = None
+if "completed_job" not in st.session_state:
+    st.session_state.completed_job = None
 
 st.title("MachinoCare - AI Predictive Maintenance")
 st.caption("Live vibration intelligence with backend-driven calibration and edge-safe inference.")
@@ -202,6 +215,7 @@ with st.sidebar:
         selected_device = st.text_input("Device", default_device)
 
     lookback_seconds = st.slider("Live lookback (seconds)", min_value=30, max_value=600, value=120, step=10)
+    refresh_seconds = st.slider("Live refresh (seconds)", min_value=1, max_value=10, value=1, step=1)
 
     st.subheader("Calibration")
     sample_rate_hz = st.number_input("Sample rate (Hz)", min_value=1, max_value=500, value=10, step=1)
@@ -234,208 +248,245 @@ with st.sidebar:
             st.session_state.active_job_device = selected_device
             st.success(f"Calibration job started: {st.session_state.active_job_id}")
 
-active_job_data = None
-if st.session_state.active_job_id:
-    active_job_data, _ = request_json(f"{api_base}/api/v1/calibrate/status/{st.session_state.active_job_id}")
-    if active_job_data and active_job_data.get("status") in {"completed", "failed"}:
-        # Keep the final result visible for one cycle, then clear to avoid stale polling.
-        st.session_state.completed_job = dict(active_job_data)
-        st.session_state.active_job_id = None
 
-status_data, status_error = request_json(
-    f"{api_base}/api/v1/status/{selected_machine}/{selected_device}"
-)
-recent_data, recent_error = request_json(
-    f"{api_base}/api/v1/stream/{selected_machine}/recent?seconds={lookback_seconds}&limit=5000&device_id={selected_device}"
-)
+def render_live_ui() -> None:
+    active_job_data = None
+    if st.session_state.active_job_id:
+        active_job_data, _ = request_json(f"{api_base}/api/v1/calibrate/status/{st.session_state.active_job_id}")
+        if active_job_data and active_job_data.get("status") in {"completed", "failed"}:
+            st.session_state.completed_job = dict(active_job_data)
+            st.session_state.active_job_id = None
 
-if status_error and recent_error:
-    st.error("Unable to reach backend. Confirm FastAPI is running and URL is correct.")
-    st.stop()
+    status_data, status_error = request_json(f"{api_base}/api/v1/status/{selected_machine}/{selected_device}")
+    recent_data, recent_error = request_json(
+        f"{api_base}/api/v1/stream/{selected_machine}/recent?seconds={lookback_seconds}&limit=5000&device_id={selected_device}"
+    )
 
-status_data = status_data or {}
-current = status_data.get("current", {})
-calibration = status_data.get("calibration", {})
-model_summary = status_data.get("model_summary", {})
+    if status_error and recent_error:
+        st.error("Unable to reach backend. Confirm FastAPI is running and URL is correct.")
+        return
 
-is_anomaly = bool(status_data.get("is_anomaly", False))
-status_label = status_data.get("status_label", "UNKNOWN")
+    status_data = status_data or {}
+    current = status_data.get("current", {})
+    calibration = status_data.get("calibration", {})
+    model_summary = status_data.get("model_summary", {})
 
-metric_cols = st.columns(4)
-metric_html = [
-    ("Current Acc Magnitude", current.get("acc_mag")),
-    ("Anomaly Score", current.get("score")),
-    ("Decision Threshold", current.get("decision_threshold") or model_summary.get("decision_threshold")),
-    ("Model Version", calibration.get("model_version")),
-]
-for col, (label, value) in zip(metric_cols, metric_html):
-    with col:
+    is_anomaly = bool(status_data.get("is_anomaly", False))
+    status_label = status_data.get("status_label", "UNKNOWN")
+
+    metric_cols = st.columns(4)
+    metric_html = [
+        ("Current Acc Magnitude", current.get("acc_mag")),
+        ("Current Gyro Magnitude", current.get("gyro_mag")),
+        ("Anomaly Score", current.get("score")),
+        ("Model Version", calibration.get("model_version")),
+    ]
+    for col, (label, value) in zip(metric_cols, metric_html):
+        with col:
+            st.markdown(
+                (
+                    "<div class='mc-glass'>"
+                    f"<div class='mc-title'>{label}</div>"
+                    f"<div class='mc-value'>{value if value is not None else 'n/a'}</div>"
+                    "</div>"
+                ),
+                unsafe_allow_html=True,
+            )
+
+    if active_job_data:
+        st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
+        st.markdown("<div class='mc-title'>Live Calibration Training</div>", unsafe_allow_html=True)
+        st.json(active_job_data)
+        st.progress(int(active_job_data.get("progress", 0)))
+        st.caption(active_job_data.get("message") or "Training in progress")
+        st.markdown("</div>", unsafe_allow_html=True)
+    elif st.session_state.get("completed_job"):
+        st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
+        st.markdown("<div class='mc-title'>Last Calibration Job</div>", unsafe_allow_html=True)
+        st.json(st.session_state.completed_job)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    left, right = st.columns([2.8, 1.2])
+    with left:
+        samples = (recent_data or {}).get("samples", [])
+        frame = normalize_recent_samples(samples)
+
+        if frame.empty:
+            st.warning("No live samples available yet. Start streaming to /api/v1/stream.")
+        else:
+            fig_primary = go.Figure()
+            for col, color in [("acc_mag", "#1177cc"), ("gyro_mag", "#059669"), ("score", "#d91e18")]:
+                if col in frame.columns:
+                    fig_primary.add_trace(
+                        go.Scatter(
+                            x=frame["timestamp"],
+                            y=frame[col],
+                            mode="lines",
+                            name=col,
+                            line={"color": color, "width": 2},
+                        )
+                    )
+
+            threshold_value = current.get("decision_threshold") or model_summary.get("decision_threshold")
+            if threshold_value is not None and "score" in frame.columns:
+                fig_primary.add_hline(
+                    y=float(threshold_value),
+                    line_dash="dash",
+                    line_color="#7f1d1d",
+                    line_width=2,
+                    annotation_text="decision threshold",
+                    annotation_position="top right",
+                )
+
+            fig_primary.update_layout(
+                title="Live Magnitude + Score",
+                template="plotly_white",
+                margin={"l": 20, "r": 20, "t": 45, "b": 20},
+                xaxis_title="Timestamp",
+                yaxis_title="Value",
+                hovermode="x unified",
+                legend={"orientation": "h", "y": 1.1, "x": 0},
+            )
+            st.plotly_chart(fig_primary, use_container_width=True)
+
+            fig_axes = go.Figure()
+            for col, color in [("gx", "#5b21b6"), ("gy", "#0f766e"), ("gz", "#b45309")]:
+                if col in frame.columns:
+                    fig_axes.add_trace(
+                        go.Scatter(
+                            x=frame["timestamp"],
+                            y=frame[col],
+                            mode="lines",
+                            name=col,
+                            line={"color": color, "width": 2},
+                        )
+                    )
+            if "sw420" in frame.columns:
+                fig_axes.add_trace(
+                    go.Scatter(
+                        x=frame["timestamp"],
+                        y=frame["sw420"],
+                        mode="lines",
+                        name="sw420",
+                        line={"color": "#111827", "width": 2, "dash": "dot"},
+                        yaxis="y2",
+                    )
+                )
+                fig_axes.update_layout(
+                    yaxis2={"overlaying": "y", "side": "right", "title": "sw420"},
+                )
+
+            fig_axes.update_layout(
+                title="Axis Vibration + SW420",
+                template="plotly_white",
+                margin={"l": 20, "r": 20, "t": 45, "b": 20},
+                xaxis_title="Timestamp",
+                yaxis_title="Gyro Axis",
+                hovermode="x unified",
+                legend={"orientation": "h", "y": 1.1, "x": 0},
+            )
+            st.plotly_chart(fig_axes, use_container_width=True)
+
+            latest = frame.tail(1).copy()
+            if not latest.empty:
+                st.subheader("Latest Sample - All Values")
+                latest_t = latest.T
+                latest_t.columns = ["value"]
+                st.dataframe(latest_t, use_container_width=True, height=420)
+
+    with right:
         st.markdown(
             (
                 "<div class='mc-glass'>"
-                f"<div class='mc-title'>{label}</div>"
-                f"<div class='mc-value'>{value if value is not None else 'n/a'}</div>"
+                "<div class='mc-title'>Machine Status</div>"
+                f"{status_badge(is_anomaly, status_label)}"
+                "<div style='margin-top:0.8rem; font-size:0.95rem;'>"
+                f"Machine: {selected_machine}<br/>"
+                f"Device: {selected_device}<br/>"
+                f"Last update: {current.get('last_update', 'n/a')}<br/>"
+                f"Consecutive anomaly windows: {current.get('consecutive_windows', 0)}<br/>"
+                f"Checksum: {calibration.get('model_checksum', 'n/a')}"
+                "</div>"
                 "</div>"
             ),
             unsafe_allow_html=True,
         )
 
-cal_progress = int(calibration.get("progress") or 0)
-cal_stage = calibration.get("stage") or "idle"
-cal_message = calibration.get("message") or "Calibration idle"
-cal_job_id = calibration.get("job_id")
+        st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
 
-if active_job_data:
-    st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
-    st.markdown("<div class='mc-title'>Live Calibration Training</div>", unsafe_allow_html=True)
-    st.write(
-        {
-            "job_id": active_job_data.get("job_id"),
-            "status": active_job_data.get("status"),
-            "stage": active_job_data.get("stage"),
-            "trigger_source": active_job_data.get("trigger_source"),
-            "new_device_setup": active_job_data.get("new_device_setup"),
-        }
-    )
-    st.progress(int(active_job_data.get("progress", 0)))
-    st.caption(active_job_data.get("message") or "Training in progress")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-elif st.session_state.get("completed_job"):
-    completed = st.session_state.completed_job
-    st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
-    st.markdown("<div class='mc-title'>Last Calibration Job</div>", unsafe_allow_html=True)
-    st.write(
-        {
-            "job_id": completed.get("job_id"),
-            "status": completed.get("status"),
-            "stage": completed.get("stage"),
-            "progress": completed.get("progress"),
-        }
-    )
-    if completed.get("status") == "completed":
-        result = completed.get("result", {})
-        pkg = result.get("model_package", {})
-        st.success("Model package generated and ready for device")
-        st.write(
+        st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
+        st.markdown("<div class='mc-title'>Calibration Runtime</div>", unsafe_allow_html=True)
+        st.progress(int(calibration.get("progress") or 0))
+        st.json(
             {
-                "model_version": pkg.get("model_version"),
-                "checksum": pkg.get("checksum"),
-                "target_device_id": pkg.get("target_device_id"),
+                "job_id": calibration.get("job_id"),
+                "progress": calibration.get("progress"),
+                "stage": calibration.get("stage"),
+                "message": calibration.get("message"),
+                "last_calibration_at": calibration.get("last_calibration_at"),
+                "model_version": calibration.get("model_version"),
+                "model_checksum": calibration.get("model_checksum"),
+                "window_size": model_summary.get("window_size"),
+                "quality_correlation": model_summary.get("quality_correlation"),
+                "decision_threshold": model_summary.get("decision_threshold"),
+                "fallback_threshold": model_summary.get("fallback_threshold"),
             }
         )
-    else:
-        st.error(completed.get("error") or "Calibration failed")
-    st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-left, right = st.columns([2.8, 1.2])
-with left:
-    samples = (recent_data or {}).get("samples", [])
-    if not samples:
-        st.warning("No live samples available yet. Start streaming to /api/v1/stream.")
-    else:
-        frame = pd.DataFrame(samples)
-        frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="coerce")
-        frame = frame.dropna(subset=["timestamp"])
+    with st.expander("Backend Payload - Full Status JSON", expanded=False):
+        st.json(status_data)
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=frame["timestamp"],
-                y=frame["acc_mag"],
-                mode="lines",
-                name="acc_mag",
-                line={"color": "#1177cc", "width": 3},
-            )
-        )
+    with st.expander("Backend Payload - Full Recent Stream JSON", expanded=False):
+        st.json(recent_data or {})
 
-        threshold_value = current.get("decision_threshold") or model_summary.get("decision_threshold")
-        if threshold_value is not None:
-            fig.add_hline(
-                y=float(threshold_value),
-                line_dash="dash",
-                line_color="#d91e18",
-                line_width=2,
-                annotation_text="AI threshold",
-                annotation_position="top right",
-            )
 
-        fig.update_layout(
-            title="Live Vibration Waveform",
-            template="plotly_white",
-            margin={"l": 20, "r": 20, "t": 45, "b": 20},
-            xaxis_title="Timestamp",
-            yaxis_title="Acceleration Magnitude",
-            hovermode="x unified",
-            legend={"orientation": "h", "y": 1.1, "x": 0},
-        )
-        st.plotly_chart(fig, use_container_width=True)
+@st.fragment(run_every=f"{refresh_seconds}s")
+def live_fragment() -> None:
+    render_live_ui()
 
-with right:
-    st.markdown(
-        (
-            "<div class='mc-glass'>"
-            "<div class='mc-title'>Machine Status</div>"
-            f"{status_badge(is_anomaly, status_label)}"
-            "<div style='margin-top:0.8rem; font-size:0.95rem;'>"
-            f"Machine: {selected_machine}<br/>"
-            f"Device: {selected_device}<br/>"
-            f"Last update: {current.get('last_update', 'n/a')}<br/>"
-            f"Consecutive anomaly windows: {current.get('consecutive_windows', 0)}<br/>"
-            f"Checksum: {calibration.get('model_checksum', 'n/a')}"
-            "</div>"
-            "</div>"
-        ),
-        unsafe_allow_html=True,
-    )
 
-    st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
-
-    st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
-    st.markdown("<div class='mc-title'>Calibration Runtime</div>", unsafe_allow_html=True)
-    st.progress(cal_progress)
-    st.write(
-        {
-            "job_id": cal_job_id,
-            "progress": cal_progress,
-            "stage": cal_stage,
-            "message": cal_message,
-            "last_calibration_at": calibration.get("last_calibration_at"),
-            "model_version": calibration.get("model_version"),
-            "window_size": model_summary.get("window_size"),
-            "quality_correlation": model_summary.get("quality_correlation"),
-        }
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
+live_fragment()
 
 st.subheader("ThingSpeak Historical Trend")
 use_thingspeak = st.toggle("Load ThingSpeak history", value=False)
 if use_thingspeak:
     channel_id = st.text_input("ThingSpeak Channel ID", THINGSPEAK_CHANNEL_DEFAULT)
-    history, history_error = thingspeak_history(channel_id=channel_id, results=80)
+    history, history_error = thingspeak_history(channel_id=channel_id, results=120)
     if history_error:
         st.error(f"ThingSpeak fetch failed: {history_error}")
     elif history is None or history.empty:
         st.info("No ThingSpeak history available.")
     else:
         hist_fig = go.Figure()
-        hist_fig.add_trace(
-            go.Scatter(
-                x=history["created_at"],
-                y=history["field1"],
-                mode="lines+markers",
-                name="ThingSpeak field1 (acc)",
-                line={"color": "#7e5bef", "width": 2},
-                marker={"size": 6},
-            )
-        )
+        for field, color in [
+            ("field1", "#1d4ed8"),
+            ("field2", "#0f766e"),
+            ("field3", "#7e22ce"),
+            ("field4", "#b45309"),
+            ("field5", "#be123c"),
+            ("field6", "#111827"),
+        ]:
+            if field in history.columns:
+                hist_fig.add_trace(
+                    go.Scatter(
+                        x=history["created_at"],
+                        y=history[field],
+                        mode="lines+markers",
+                        name=field,
+                        line={"color": color, "width": 2},
+                        marker={"size": 5},
+                    )
+                )
         hist_fig.update_layout(
+            title="ThingSpeak Fields 1-6",
             template="plotly_white",
             margin={"l": 20, "r": 20, "t": 30, "b": 20},
             xaxis_title="Timestamp",
-            yaxis_title="ThingSpeak Acc Magnitude",
+            yaxis_title="Field Value",
+            hovermode="x unified",
         )
         st.plotly_chart(hist_fig, use_container_width=True)
 
 footer_stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-st.caption(f"Dashboard refresh timestamp: {footer_stamp}")
+st.caption(f"Dashboard loaded at: {footer_stamp}")
