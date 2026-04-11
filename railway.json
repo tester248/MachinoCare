@@ -1,7 +1,7 @@
 {
   "$schema": "https://railway.app/railway.schema.json",
   "deploy": {
-    "startCommand": "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT}",
+    "startCommand": "python run_all.py",
     "healthcheckPath": "/api/v1/health",
     "restartPolicyType": "on_failure",
     "restartPolicyMaxRetries": 10
