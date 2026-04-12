@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from collections import defaultdict, deque
@@ -8,11 +9,83 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - optional runtime dependency
+    psycopg = None
+    dict_row = None
+
+
+class _CursorAdapter:
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+
+    def fetchall(self) -> Any:
+        return self._cursor.fetchall()
+
+    def fetchone(self) -> Any:
+        return self._cursor.fetchone()
+
+    @property
+    def rowcount(self) -> int:
+        return int(getattr(self._cursor, "rowcount", 0) or 0)
+
+
+class _DbConnectionAdapter:
+    def __init__(self, db_path: str, database_url: str | None = None) -> None:
+        self.database_url = database_url or os.getenv("DATABASE_URL")
+        self.backend = "sqlite"
+
+        if self.database_url and self.database_url.startswith(("postgres://", "postgresql://")):
+            if psycopg is None:
+                raise RuntimeError(
+                    "DATABASE_URL is set for PostgreSQL but psycopg is not installed. "
+                    "Install psycopg[binary] to use PostgreSQL."
+                )
+
+            normalized = self.database_url.replace("postgres://", "postgresql://", 1)
+            self._conn = psycopg.connect(normalized, row_factory=dict_row)
+            self.backend = "postgres"
+            return
+
+        db_parent = Path(db_path).parent
+        db_parent.mkdir(parents=True, exist_ok=True)
+
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+
+    def __enter__(self) -> "_DbConnectionAdapter":
+        self._conn.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return self._conn.__exit__(exc_type, exc, tb)
+
+    def _sql(self, query: str) -> str:
+        if self.backend == "postgres":
+            return query.replace("?", "%s")
+        return query
+
+    def execute(self, query: str, params: tuple[Any, ...] | list[Any] = ()) -> _CursorAdapter:
+        cursor = self._conn.execute(self._sql(query), params)
+        return _CursorAdapter(cursor)
+
+    def executemany(self, query: str, rows: list[tuple[Any, ...]]) -> _CursorAdapter:
+        cursor = self._conn.executemany(self._sql(query), rows)
+        return _CursorAdapter(cursor)
+
 
 class DataStore:
     """Hybrid storage: in-memory for live reads + SQLite durability."""
 
-    def __init__(self, db_path: str, max_buffer_size: int = 6000) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        max_buffer_size: int = 6000,
+        database_url: str | None = None,
+    ) -> None:
         self.db_path = db_path
         self.max_buffer_size = max_buffer_size
         self.buffers: dict[str, deque[dict[str, Any]]] = defaultdict(
@@ -22,61 +95,70 @@ class DataStore:
         self.model_packages: dict[str, dict[str, Any]] = {}
         self._lock = threading.Lock()
 
-        db_parent = Path(db_path).parent
-        db_parent.mkdir(parents=True, exist_ok=True)
-
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn = _DbConnectionAdapter(self.db_path, database_url=database_url)
+        self.backend = self.conn.backend
         self._init_db()
 
     @staticmethod
     def _device_key(machine_id: str, device_id: str) -> str:
         return f"{machine_id}::{device_id}"
 
+    @staticmethod
+    def _first_value(row: Any) -> Any:
+        if row is None:
+            return None
+        if isinstance(row, dict):
+            return next(iter(row.values()), None)
+        return row[0]
+
     def _init_db(self) -> None:
+        if self.backend == "postgres":
+            id_column = "BIGSERIAL PRIMARY KEY"
+        else:
+            id_column = "INTEGER PRIMARY KEY AUTOINCREMENT"
+
         with self.conn:
             self.conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS stream_samples (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column},
                     machine_id TEXT NOT NULL,
                     device_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
-                    acc_mag REAL NOT NULL,
-                    gyro_mag REAL NOT NULL,
-                    gx REAL NOT NULL,
-                    gy REAL NOT NULL,
-                    gz REAL NOT NULL,
+                    acc_mag DOUBLE PRECISION NOT NULL,
+                    gyro_mag DOUBLE PRECISION NOT NULL,
+                    gx DOUBLE PRECISION NOT NULL,
+                    gy DOUBLE PRECISION NOT NULL,
+                    gz DOUBLE PRECISION NOT NULL,
                     sw420 INTEGER,
                     sequence INTEGER
                 )
                 """
             )
             self.conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS calibrations (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column},
                     machine_id TEXT NOT NULL,
                     device_id TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    baseline_mean_acc REAL NOT NULL,
-                    baseline_std_acc REAL NOT NULL,
-                    threshold_mean_3sigma REAL NOT NULL,
+                    baseline_mean_acc DOUBLE PRECISION NOT NULL,
+                    baseline_std_acc DOUBLE PRECISION NOT NULL,
+                    threshold_mean_3sigma DOUBLE PRECISION NOT NULL,
                     package_json TEXT NOT NULL
                 )
                 """
             )
             self.conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS anomaly_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column},
                     machine_id TEXT NOT NULL,
                     device_id TEXT NOT NULL,
                     timestamp TEXT NOT NULL,
-                    acc_mag REAL NOT NULL,
-                    score REAL,
-                    threshold REAL,
+                    acc_mag DOUBLE PRECISION NOT NULL,
+                    score DOUBLE PRECISION,
+                    threshold DOUBLE PRECISION,
                     reason TEXT
                 )
                 """
@@ -91,16 +173,16 @@ class DataStore:
                 "CREATE INDEX IF NOT EXISTS idx_anom_machine_time ON anomaly_events(machine_id, timestamp)"
             )
             self.conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS device_profiles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column},
                     machine_id TEXT NOT NULL,
                     device_id TEXT NOT NULL,
                     display_name TEXT,
                     sample_rate_hz INTEGER,
                     window_seconds INTEGER,
                     fallback_seconds INTEGER,
-                    contamination REAL,
+                    contamination DOUBLE PRECISION,
                     min_consecutive_windows INTEGER,
                     notes TEXT,
                     created_at TEXT NOT NULL,
@@ -110,9 +192,9 @@ class DataStore:
                 """
             )
             self.conn.execute(
-                """
+                f"""
                 CREATE TABLE IF NOT EXISTS api_debug_logs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id {id_column},
                     created_at TEXT NOT NULL,
                     endpoint TEXT NOT NULL,
                     method TEXT NOT NULL,
@@ -660,6 +742,64 @@ class DataStore:
 
         return decoded
 
+    def list_api_debug_logs_since(
+        self,
+        *,
+        after_id: int,
+        machine_id: str | None = None,
+        device_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = [after_id]
+        clauses: list[str] = ["id > ?"]
+        if machine_id is not None:
+            clauses.append("machine_id = ?")
+            params.append(machine_id)
+        if device_id is not None:
+            clauses.append("device_id = ?")
+            params.append(device_id)
+
+        params.append(limit)
+        where = " AND ".join(clauses)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                id,
+                created_at,
+                endpoint,
+                method,
+                machine_id,
+                device_id,
+                status_code,
+                latency_ms,
+                request_size,
+                response_size,
+                correlation_id,
+                is_error,
+                payload_sampled,
+                request_payload,
+                response_payload,
+                error_text
+            FROM api_debug_logs
+            WHERE {where}
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        decoded: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["is_error"] = bool(item.get("is_error"))
+            item["payload_sampled"] = bool(item.get("payload_sampled"))
+            item["request_payload"] = self._decode_json_payload(item.get("request_payload"))
+            item["response_payload"] = self._decode_json_payload(item.get("response_payload"))
+            decoded.append(item)
+
+        return decoded
+
     def purge_api_debug_logs_older_than(self, days: int) -> int:
         if days <= 0:
             return 0
@@ -680,7 +820,7 @@ class DataStore:
                 known.add(machine)
 
         rows = self.conn.execute("SELECT DISTINCT machine_id FROM stream_samples").fetchall()
-        known.update(row[0] for row in rows)
+        known.update(self._first_value(row) for row in rows)
         return sorted(known)
 
     def list_devices(self, machine_id: str) -> list[str]:
@@ -700,19 +840,19 @@ class DataStore:
             "SELECT DISTINCT device_id FROM stream_samples WHERE machine_id = ?",
             (machine_id,),
         ).fetchall()
-        devices.update(row[0] for row in rows)
+        devices.update(self._first_value(row) for row in rows)
 
         rows = self.conn.execute(
             "SELECT DISTINCT device_id FROM calibrations WHERE machine_id = ?",
             (machine_id,),
         ).fetchall()
-        devices.update(row[0] for row in rows)
+        devices.update(self._first_value(row) for row in rows)
 
         rows = self.conn.execute(
             "SELECT DISTINCT device_id FROM device_profiles WHERE machine_id = ?",
             (machine_id,),
         ).fetchall()
-        devices.update(row[0] for row in rows)
+        devices.update(self._first_value(row) for row in rows)
 
         return sorted(d for d in devices if d)
 
@@ -735,8 +875,9 @@ class DataStore:
             """,
             (machine_id,),
         ).fetchone()
-        if row and row[0]:
-            return str(row[0])
+        value = self._first_value(row)
+        if value:
+            return str(value)
 
         row = self.conn.execute(
             """
@@ -748,7 +889,8 @@ class DataStore:
             """,
             (machine_id,),
         ).fetchone()
-        if row and row[0]:
-            return str(row[0])
+        value = self._first_value(row)
+        if value:
+            return str(value)
 
         return None

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import random
@@ -9,9 +10,9 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from backend.ml_engine import (
     FEATURE_ORDER,
@@ -32,15 +33,18 @@ from backend.models import (
     DeviceProfileUpsertRequest,
     StreamIngestRequest,
 )
+from backend.debug_dashboard import get_debug_dashboard_html
 from backend.storage import DataStore
 
 DB_PATH = os.getenv("MACHINOCARE_DB", "data/machinocare.db")
+DATABASE_URL = os.getenv("DATABASE_URL")
 BUFFER_SIZE = int(os.getenv("MACHINOCARE_BUFFER_SIZE", "12000"))
 DEBUG_SAMPLE_RATE = max(0.0, min(1.0, float(os.getenv("MACHINOCARE_DEBUG_SAMPLE_RATE", "0.10"))))
 DEBUG_RETENTION_DAYS = int(os.getenv("MACHINOCARE_DEBUG_RETENTION_DAYS", "30"))
 DEBUG_MAX_BODY_BYTES = int(os.getenv("MACHINOCARE_DEBUG_MAX_BODY_BYTES", "20000"))
+LIVE_PUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("MACHINOCARE_LIVE_PUSH_INTERVAL_SECONDS", "0.75")))
 
-store = DataStore(db_path=DB_PATH, max_buffer_size=BUFFER_SIZE)
+store = DataStore(db_path=DB_PATH, max_buffer_size=BUFFER_SIZE, database_url=DATABASE_URL)
 
 app = FastAPI(
     title="MachinoCare Backend",
@@ -68,6 +72,11 @@ last_debug_purge_monotonic = 0.0
 @app.get("/", include_in_schema=False)
 def root() -> RedirectResponse:
     return RedirectResponse(url="/docs", status_code=307)
+
+
+@app.get("/debug-dashboard", include_in_schema=False)
+def debug_dashboard() -> HTMLResponse:
+    return HTMLResponse(content=get_debug_dashboard_html())
 
 
 def utc_iso_now() -> str:
@@ -234,6 +243,14 @@ async def api_debug_log_middleware(request: Request, call_next: Any) -> Response
 
 def round_list(values: list[float], ndigits: int = 6) -> list[float]:
     return [round(float(v), ndigits) for v in values]
+
+
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(minimum, min(maximum, parsed))
 
 
 def sample_to_record(sample: Any) -> dict[str, Any]:
@@ -549,7 +566,12 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
 
 @router.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "machinocare-backend", "time": utc_iso_now()}
+    return {
+        "status": "ok",
+        "service": "machinocare-backend",
+        "time": utc_iso_now(),
+        "db_backend": store.backend,
+    }
 
 
 @router.post("/stream", status_code=202)
@@ -959,6 +981,119 @@ def debug_logs(
         "count": len(logs),
         "logs": [ApiDebugLogEntry(**item).model_dump() for item in logs],
     }
+
+
+@router.websocket("/ws/live")
+async def ws_live(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    machine_id = websocket.query_params.get("machine_id") or "Fan_1"
+    device_id = websocket.query_params.get("device_id")
+    lookback_seconds = _bounded_int(
+        websocket.query_params.get("lookback_seconds"),
+        default=120,
+        minimum=10,
+        maximum=86400,
+    )
+    last_log_id = _bounded_int(
+        websocket.query_params.get("last_log_id"),
+        default=0,
+        minimum=0,
+        maximum=2_000_000_000,
+    )
+    last_sample_timestamp = ""
+
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "machine_id": machine_id,
+            "device_id": device_id,
+            "server_timestamp": utc_iso_now(),
+        }
+    )
+
+    while True:
+        try:
+            message = await asyncio.wait_for(websocket.receive_text(), timeout=LIVE_PUSH_INTERVAL_SECONDS)
+            if message:
+                try:
+                    payload = json.loads(message)
+                except json.JSONDecodeError:
+                    payload = {}
+
+                if payload.get("type") == "subscribe":
+                    machine_id = payload.get("machine_id") or machine_id
+                    device_id = payload.get("device_id") or device_id
+                    lookback_seconds = _bounded_int(
+                        payload.get("lookback_seconds"),
+                        default=lookback_seconds,
+                        minimum=10,
+                        maximum=86400,
+                    )
+                    last_log_id = _bounded_int(
+                        payload.get("last_log_id"),
+                        default=last_log_id,
+                        minimum=0,
+                        maximum=2_000_000_000,
+                    )
+                    last_sample_timestamp = ""
+
+                if payload.get("type") == "ping":
+                    await websocket.send_json({"type": "pong", "server_timestamp": utc_iso_now()})
+
+        except asyncio.TimeoutError:
+            pass
+        except WebSocketDisconnect:
+            break
+
+        if machine_id and not device_id:
+            device_id = store.latest_device_for_machine(machine_id)
+
+        new_logs = store.list_api_debug_logs_since(
+            after_id=last_log_id,
+            machine_id=machine_id,
+            device_id=device_id,
+            limit=120,
+        )
+        if new_logs:
+            last_log_id = max(last_log_id, int(new_logs[-1].get("id", last_log_id)))
+
+        latest_sample = None
+        if machine_id:
+            samples = store.get_recent_samples(
+                machine_id,
+                device_id=device_id,
+                seconds=lookback_seconds,
+                limit=500,
+            )
+            if samples:
+                candidate = samples[-1]
+                candidate_ts = str(candidate.get("timestamp") or "")
+                if candidate_ts and candidate_ts != last_sample_timestamp:
+                    latest_sample = candidate
+                    last_sample_timestamp = candidate_ts
+
+        status_payload = None
+        try:
+            if machine_id and device_id:
+                status_payload = get_status_for_device(machine_id, device_id)
+            elif machine_id:
+                status_payload = get_status(machine_id)
+                device_id = status_payload.get("device_id") or device_id
+        except HTTPException:
+            status_payload = None
+
+        await websocket.send_json(
+            {
+                "type": "snapshot",
+                "machine_id": machine_id,
+                "device_id": device_id,
+                "server_timestamp": utc_iso_now(),
+                "latest_sample": latest_sample,
+                "status": status_payload,
+                "new_logs": [ApiDebugLogEntry(**item).model_dump() for item in new_logs],
+            }
+        )
 
 
 app.include_router(router, prefix="/api/v1")

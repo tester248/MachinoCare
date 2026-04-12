@@ -5,7 +5,7 @@ MachinoCare is an end-to-end predictive maintenance system for vibration-based m
 It combines:
 - ESP32 edge firmware (MPU6050 + SW420 + relays + buttons)
 - FastAPI backend for streaming, calibration, and model management
-- Streamlit dashboard for live telemetry, calibration control, and historical trend views
+- Streamlit dashboard (fallback) + FastAPI realtime debug dashboard
 
 ## What This Repository Contains
 
@@ -31,7 +31,8 @@ It combines:
 - Synchronous calibration (`/api/v1/calibrate`) and async calibration jobs (`/api/v1/calibrate/start`)
 - Device-specific status and model package endpoints
 - Recent stream retrieval, anomaly logs, machine/device discovery
-- Lightweight persistent storage via SQLite plus in-memory buffers
+- Realtime WebSocket debug feed (`/api/v1/ws/live`)
+- SQLite or PostgreSQL persistence (`DATABASE_URL` auto-detected)
 
 ### Firmware (ESP32)
 - 2-relay control (motor + fan)
@@ -47,6 +48,7 @@ It combines:
 - Calibration control and progress monitoring
 - Full backend payload inspectors for troubleshooting
 - ThingSpeak multi-field historical chart
+- New backend-served realtime debug dashboard (`/debug-dashboard`) with no Streamlit rerender greying
 
 ## Quick Start (Local)
 
@@ -85,6 +87,7 @@ python run_all.py
 
 - Backend docs: `http://localhost:8000/docs`
 - Dashboard: `http://localhost:8501`
+- Realtime debug dashboard: `http://localhost:8000/debug-dashboard`
 - Health: `http://localhost:8000/api/v1/health`
 
 ## API Surface (Current)
@@ -117,6 +120,7 @@ python run_all.py
 - `GET /api/v1/device-profiles`
 - `GET /api/v1/device-profiles/{machine_id}/{device_id}`
 - `GET /api/v1/debug/logs`
+- `WS /api/v1/ws/live`
 
 These endpoints are additive and do not require ESP32 firmware changes.
 
@@ -203,13 +207,25 @@ For Railway (or similar platforms):
 2. Railway reads `railway.toml` on push and starts with `python run_all.py`.
 3. `run_all.py` starts FastAPI on Railway's `PORT` and Streamlit on `DASHBOARD_PORT` (default `8501`) in parallel.
 4. If using Railway proxying for dashboard, route proxy traffic to `DASHBOARD_PORT`.
-5. Set persistent DB path if desired:
+5. Add a Railway PostgreSQL service and set `DATABASE_URL` for managed DB persistence (auto-used by backend).
+6. Set persistent SQLite path only if not using PostgreSQL:
      - `MACHINOCARE_DB=/data/machinocare.db`
-6. Verify after deploy:
+7. Verify after deploy:
      - `/api/v1/health`
      - `/docs`
+    - `/debug-dashboard`
 
-If no persistent volume is attached, SQLite data resets on redeploy/restart.
+Railway CLI bootstrap (automated):
+
+```bash
+railway login
+RAILWAY_PROJECT_ID=<project-id> RAILWAY_BACKEND_SERVICE=<backend-service-name> ./scripts/railway_setup_postgres.sh
+railway up
+```
+
+The script creates or reuses a PostgreSQL service, wires `DATABASE_URL` into your backend service, and sets debug dashboard runtime variables.
+
+If neither PostgreSQL nor persistent volume is attached, SQLite data resets on redeploy/restart.
 
 ## Development Notes
 
