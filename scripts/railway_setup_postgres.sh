@@ -16,6 +16,24 @@ ENVIRONMENT="${RAILWAY_ENVIRONMENT:-}"
 BACKEND_SERVICE="${RAILWAY_BACKEND_SERVICE:-}"
 SKIP_CREATE_DB="${RAILWAY_SKIP_CREATE_DB:-0}"
 
+postgres_service_exists() {
+  railway status --json 2>/tmp/railway_status.err | python - "$POSTGRES_SERVICE" <<'PY'
+import json
+import sys
+
+target = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    print("0")
+    raise SystemExit(0)
+
+services = ((payload.get("services") or {}).get("edges") or [])
+names = [((item.get("node") or {}).get("name")) for item in services]
+print("1" if target in names else "0")
+PY
+}
+
 if ! command -v railway >/dev/null 2>&1; then
   echo "railway CLI not found. Install with: npm install -g @railway/cli" >&2
   exit 1
@@ -40,14 +58,29 @@ if [[ ${#link_args[@]} -gt 0 ]]; then
 fi
 
 if [[ "$SKIP_CREATE_DB" != "1" ]]; then
-  echo "Ensuring PostgreSQL service exists: $POSTGRES_SERVICE"
-  if ! railway add --database postgres --service "$POSTGRES_SERVICE" --json >/tmp/railway_add_postgres.json 2>/tmp/railway_add_postgres.err; then
-    echo "PostgreSQL service create returned non-zero; checking if it already exists or requires manual action."
-    cat /tmp/railway_add_postgres.err || true
+  if [[ "$(postgres_service_exists)" == "1" ]]; then
+    echo "PostgreSQL service already exists: $POSTGRES_SERVICE"
   else
-    echo "PostgreSQL service creation output:"
-    cat /tmp/railway_add_postgres.json || true
+    echo "Ensuring PostgreSQL service exists: $POSTGRES_SERVICE"
+    if ! railway add --database postgres --service "$POSTGRES_SERVICE" --json >/tmp/railway_add_postgres.json 2>/tmp/railway_add_postgres.err; then
+      echo "PostgreSQL service create failed."
+      cat /tmp/railway_add_postgres.err || true
+      if [[ "$(postgres_service_exists)" != "1" ]]; then
+        echo "PostgreSQL service '$POSTGRES_SERVICE' is still missing."
+        echo "Fix Railway auth/permissions, or create the DB service in Railway UI, then rerun this script."
+        exit 1
+      fi
+    else
+      echo "PostgreSQL service creation output:"
+      cat /tmp/railway_add_postgres.json || true
+    fi
   fi
+fi
+
+if [[ "$(postgres_service_exists)" != "1" ]]; then
+  echo "PostgreSQL service '$POSTGRES_SERVICE' not found."
+  echo "Create it first (CLI or UI), then rerun this script."
+  exit 1
 fi
 
 if [[ -z "$BACKEND_SERVICE" ]]; then
