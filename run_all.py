@@ -8,13 +8,27 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_BACKEND_PORT = "8000"
+DEFAULT_DASHBOARD_PORT = "8501"
+
+
+def resolve_ports() -> tuple[str, str]:
+    backend_port = os.getenv("PORT") or os.getenv("BACKEND_PORT", DEFAULT_BACKEND_PORT)
+    dashboard_port = os.getenv("DASHBOARD_PORT", DEFAULT_DASHBOARD_PORT)
+
+    if dashboard_port == backend_port:
+        for candidate in (DEFAULT_DASHBOARD_PORT, "8502", "8503", "8601", "9001"):
+            if candidate != backend_port:
+                dashboard_port = candidate
+                break
+
+    return backend_port, dashboard_port
 
 
 def start_processes() -> tuple[subprocess.Popen, subprocess.Popen]:
     backend_host = os.getenv("BACKEND_HOST", "0.0.0.0")
-    backend_port = os.getenv("BACKEND_PORT", "8000")
     dashboard_host = os.getenv("DASHBOARD_HOST", "0.0.0.0")
-    dashboard_port = os.getenv("DASHBOARD_PORT", "8501")
+    backend_port, dashboard_port = resolve_ports()
     enable_reload = os.getenv("ENABLE_RELOAD", "0") == "1"
 
     backend_cmd = [
