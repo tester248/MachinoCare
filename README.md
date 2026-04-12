@@ -187,13 +187,16 @@ Detailed Blynk setup:
 
 This repo includes:
 - `Procfile` (`web: python run_all.py`)
+- `railway.toml` (automatic Railway build/start/healthcheck config)
 
 For Railway (or similar platforms):
 1. Deploy from GitHub repository.
-2. Ensure dependencies install from `requirements.txt`.
-3. Set persistent DB path if desired:
+2. Railway reads `railway.toml` on push and starts with `python run_all.py`.
+3. `run_all.py` starts FastAPI on Railway's `PORT` and Streamlit on `DASHBOARD_PORT` (default `8501`) in parallel.
+4. If using Railway proxying for dashboard, route proxy traffic to `DASHBOARD_PORT`.
+5. Set persistent DB path if desired:
      - `MACHINOCARE_DB=/data/machinocare.db`
-4. Verify after deploy:
+6. Verify after deploy:
      - `/api/v1/health`
      - `/docs`
 
