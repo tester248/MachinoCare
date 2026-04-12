@@ -240,6 +240,19 @@ class DataStore:
                 """
             )
             self.conn.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS stream_bindings (
+                    id {id_column},
+                    binding_name TEXT NOT NULL UNIQUE,
+                    machine_id TEXT,
+                    device_id TEXT,
+                    source TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_profiles_machine_device ON device_profiles(machine_id, device_id)"
             )
             self.conn.execute(
@@ -253,6 +266,9 @@ class DataStore:
             )
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_debug_endpoint_time ON api_debug_logs(endpoint, created_at)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_stream_bindings_name ON stream_bindings(binding_name)"
             )
 
     def add_samples(
@@ -649,6 +665,122 @@ class DataStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def delete_device_profile(self, machine_id: str, device_id: str) -> bool:
+        with self.conn:
+            cursor = self.conn.execute(
+                "DELETE FROM device_profiles WHERE machine_id = ? AND device_id = ?",
+                (machine_id, device_id),
+            )
+
+        deleted = int(cursor.rowcount or 0) > 0
+        if deleted:
+            binding = self.get_stream_binding()
+            if (
+                binding
+                and binding.get("is_active")
+                and binding.get("machine_id") == machine_id
+                and binding.get("device_id") == device_id
+            ):
+                self.clear_stream_binding(source="profile_deleted")
+        return deleted
+
+    def get_stream_binding(self, binding_name: str = "primary") -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT binding_name, machine_id, device_id, source, is_active, updated_at
+            FROM stream_bindings
+            WHERE binding_name = ?
+            LIMIT 1
+            """,
+            (binding_name,),
+        ).fetchone()
+        if not row:
+            return None
+
+        item = dict(row)
+        item["is_active"] = bool(item.get("is_active"))
+        return item
+
+    def set_stream_binding(
+        self,
+        *,
+        machine_id: str,
+        device_id: str,
+        source: str = "dashboard_manual",
+        binding_name: str = "primary",
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO stream_bindings (
+                    binding_name,
+                    machine_id,
+                    device_id,
+                    source,
+                    is_active,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(binding_name)
+                DO UPDATE SET
+                    machine_id = excluded.machine_id,
+                    device_id = excluded.device_id,
+                    source = excluded.source,
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at
+                """,
+                (binding_name, machine_id, device_id, source, 1, now),
+            )
+
+        binding = self.get_stream_binding(binding_name)
+        return binding or {
+            "binding_name": binding_name,
+            "machine_id": machine_id,
+            "device_id": device_id,
+            "source": source,
+            "is_active": True,
+            "updated_at": now,
+        }
+
+    def clear_stream_binding(
+        self,
+        *,
+        source: str = "dashboard_manual",
+        binding_name: str = "primary",
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO stream_bindings (
+                    binding_name,
+                    machine_id,
+                    device_id,
+                    source,
+                    is_active,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(binding_name)
+                DO UPDATE SET
+                    machine_id = excluded.machine_id,
+                    device_id = excluded.device_id,
+                    source = excluded.source,
+                    is_active = excluded.is_active,
+                    updated_at = excluded.updated_at
+                """,
+                (binding_name, None, None, source, 0, now),
+            )
+
+        binding = self.get_stream_binding(binding_name)
+        return binding or {
+            "binding_name": binding_name,
+            "machine_id": None,
+            "device_id": None,
+            "source": source,
+            "is_active": False,
+            "updated_at": now,
+        }
+
     @staticmethod
     def _encode_json_payload(payload: Any) -> str | None:
         if payload is None:
@@ -847,6 +979,12 @@ class DataStore:
 
         rows = self.conn.execute("SELECT DISTINCT machine_id FROM stream_samples").fetchall()
         known.update(self._first_value(row) for row in rows)
+
+        rows = self.conn.execute(
+            "SELECT DISTINCT machine_id FROM stream_bindings WHERE machine_id IS NOT NULL"
+        ).fetchall()
+        known.update(self._first_value(row) for row in rows)
+
         return sorted(known)
 
     def list_devices(self, machine_id: str) -> list[str]:
@@ -876,6 +1014,12 @@ class DataStore:
 
         rows = self.conn.execute(
             "SELECT DISTINCT device_id FROM device_profiles WHERE machine_id = ?",
+            (machine_id,),
+        ).fetchall()
+        devices.update(self._first_value(row) for row in rows)
+
+        rows = self.conn.execute(
+            "SELECT DISTINCT device_id FROM stream_bindings WHERE machine_id = ? AND device_id IS NOT NULL",
             (machine_id,),
         ).fetchall()
         devices.update(self._first_value(row) for row in rows)

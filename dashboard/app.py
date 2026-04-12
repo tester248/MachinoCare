@@ -120,8 +120,11 @@ st.markdown(
 
 def request_json(url: str, method: str = "GET", payload: dict | None = None) -> tuple[dict | None, str | None]:
     try:
+        method = method.upper()
         if method == "POST":
             response = requests.post(url, json=payload, timeout=5)
+        elif method == "DELETE":
+            response = requests.delete(url, timeout=5)
         else:
             response = requests.get(url, timeout=5)
         response.raise_for_status()
@@ -197,49 +200,181 @@ with st.sidebar:
     st.header("Controls")
     api_base = st.text_input("FastAPI Base URL", API_DEFAULT)
 
-    machines_data, _ = request_json(f"{api_base}/api/v1/machines")
-    machine_options = machines_data.get("machines", []) if machines_data else []
+    profiles_data, profiles_error = request_json(f"{api_base}/api/v1/device-profiles?limit=500")
+    profile_rows = profiles_data.get("profiles", []) if profiles_data else []
+    profile_lookup: dict[str, tuple[str, str]] = {}
+    profile_labels: list[str] = []
+    for profile in profile_rows:
+        machine = str(profile.get("machine_id") or "").strip()
+        device = str(profile.get("device_id") or "").strip()
+        if not machine or not device:
+            continue
+        display_name = str(profile.get("display_name") or "").strip()
+        label = f"{display_name} ({machine}/{device})" if display_name else f"{machine}/{device}"
+        profile_lookup[label] = (machine, device)
+        profile_labels.append(label)
 
-    default_machine = "Fan_1"
-    if machine_options:
-        selected_machine = st.selectbox("Machine", machine_options)
-    else:
-        selected_machine = st.text_input("Machine", default_machine)
+    binding_data, binding_error = request_json(f"{api_base}/api/v1/stream-binding")
+    active_binding = binding_data or {}
+    active_binding_machine = active_binding.get("machine_id") if active_binding.get("is_active") else None
+    active_binding_device = active_binding.get("device_id") if active_binding.get("is_active") else None
 
-    device_data, _ = request_json(f"{api_base}/api/v1/devices/{selected_machine}")
-    device_options = device_data.get("devices", []) if device_data else []
-    default_device = "esp32_fan_1"
-    if device_options:
-        selected_device = st.selectbox("Device", device_options)
+    if profile_labels:
+        default_label = profile_labels[0]
+        if active_binding_machine and active_binding_device:
+            for label, pair in profile_lookup.items():
+                if pair == (active_binding_machine, active_binding_device):
+                    default_label = label
+                    break
+
+        selected_profile_label = st.selectbox(
+            "Profile target",
+            options=profile_labels,
+            index=profile_labels.index(default_label),
+        )
+        selected_machine, selected_device = profile_lookup[selected_profile_label]
     else:
-        selected_device = st.text_input("Device", default_device)
+        machines_data, _ = request_json(f"{api_base}/api/v1/machines")
+        machine_options = machines_data.get("machines", []) if machines_data else []
+
+        default_machine = "Fan_1"
+        if machine_options:
+            selected_machine = st.selectbox("Machine", machine_options)
+        else:
+            selected_machine = st.text_input("Machine", default_machine)
+
+        device_data, _ = request_json(f"{api_base}/api/v1/devices/{selected_machine}")
+        device_options = device_data.get("devices", []) if device_data else []
+        default_device = "esp32_fan_1"
+        if device_options:
+            selected_device = st.selectbox("Device", device_options)
+        else:
+            selected_device = st.text_input("Device", default_device)
+
+    st.subheader("Incoming Stream Association")
+    if active_binding_machine and active_binding_device:
+        st.success(f"Incoming stream -> {active_binding_machine}/{active_binding_device}")
+    else:
+        st.warning("No active association. Incoming stream routes to unassigned target.")
+
+    association_col, clear_col = st.columns(2)
+    if association_col.button("Associate stream", use_container_width=True):
+        bind_data, bind_error = request_json(
+            f"{api_base}/api/v1/stream-binding",
+            method="POST",
+            payload={
+                "machine_id": selected_machine,
+                "device_id": selected_device,
+                "source": "streamlit_dashboard",
+            },
+        )
+        if bind_error:
+            st.error(f"Stream association failed: {bind_error}")
+        else:
+            st.success(
+                "Incoming stream now targets "
+                f"{bind_data.get('machine_id')}/{bind_data.get('device_id')}"
+            )
+
+    if clear_col.button("Clear association", use_container_width=True):
+        _, clear_error = request_json(
+            f"{api_base}/api/v1/stream-binding?source=streamlit_dashboard",
+            method="DELETE",
+        )
+        if clear_error:
+            st.error(f"Failed clearing association: {clear_error}")
+        else:
+            st.success("Incoming stream association cleared.")
+
+    if profiles_error:
+        st.caption(f"Profile list warning: {profiles_error}")
+    if binding_error:
+        st.caption(f"Binding lookup warning: {binding_error}")
 
     lookback_seconds = st.slider("Live lookback (seconds)", min_value=30, max_value=600, value=120, step=10)
     refresh_seconds = st.slider("Live refresh (seconds)", min_value=1, max_value=10, value=1, step=1)
 
+    selected_profile_data, _ = request_json(
+        f"{api_base}/api/v1/device-profiles/{selected_machine}/{selected_device}"
+    )
+    default_sample_rate_hz = int((selected_profile_data or {}).get("sample_rate_hz") or 10)
+    default_window_seconds = int((selected_profile_data or {}).get("window_seconds") or 1)
+    default_fallback_seconds = int((selected_profile_data or {}).get("fallback_seconds") or 300)
+    default_contamination = float((selected_profile_data or {}).get("contamination") or 0.05)
+    default_min_windows = int((selected_profile_data or {}).get("min_consecutive_windows") or 3)
+
     st.subheader("Calibration")
-    sample_rate_hz = st.number_input("Sample rate (Hz)", min_value=1, max_value=500, value=10, step=1)
-    fallback_seconds = st.number_input("Fallback window (s)", min_value=30, max_value=3600, value=300, step=30)
-    contamination = st.slider("Isolation Forest contamination", min_value=0.01, max_value=0.40, value=0.05, step=0.01)
+    use_profile_defaults = st.toggle("Use saved profile settings", value=True)
+    sample_rate_hz = st.number_input(
+        "Sample rate (Hz)",
+        min_value=1,
+        max_value=500,
+        value=default_sample_rate_hz,
+        step=1,
+    )
+    window_seconds = st.number_input(
+        "Window size (s)",
+        min_value=1,
+        max_value=10,
+        value=default_window_seconds,
+        step=1,
+    )
+    fallback_seconds = st.number_input(
+        "Fallback window (s)",
+        min_value=30,
+        max_value=3600,
+        value=default_fallback_seconds,
+        step=30,
+    )
+    contamination = st.slider(
+        "Isolation Forest contamination",
+        min_value=0.01,
+        max_value=0.40,
+        value=default_contamination,
+        step=0.01,
+    )
+    min_consecutive_windows = st.number_input(
+        "Min consecutive windows",
+        min_value=1,
+        max_value=10,
+        value=default_min_windows,
+        step=1,
+    )
     new_device_setup = st.toggle("New device setup", value=True)
 
     if st.button("Start calibration training", use_container_width=True):
-        payload = {
-            "machine_id": selected_machine,
-            "device_id": selected_device,
-            "sample_rate_hz": int(sample_rate_hz),
-            "fallback_seconds": int(fallback_seconds),
-            "window_seconds": 1,
-            "contamination": float(contamination),
-            "min_consecutive_windows": 3,
-            "new_device_setup": bool(new_device_setup),
-            "trigger_source": "dashboard_ui",
-        }
-        start_data, start_error = request_json(
-            f"{api_base}/api/v1/calibrate/start",
-            method="POST",
-            payload=payload,
-        )
+        start_data = None
+        start_error = None
+        if use_profile_defaults:
+            query = "true" if bool(new_device_setup) else "false"
+            start_data, start_error = request_json(
+                (
+                    f"{api_base}/api/v1/calibrate/start/profile/{selected_machine}/{selected_device}"
+                    f"?new_device_setup={query}&trigger_source=dashboard_ui"
+                ),
+                method="POST",
+            )
+
+        if (not use_profile_defaults) or start_error:
+            payload = {
+                "machine_id": selected_machine,
+                "device_id": selected_device,
+                "sample_rate_hz": int(sample_rate_hz),
+                "fallback_seconds": int(fallback_seconds),
+                "window_seconds": int(window_seconds),
+                "contamination": float(contamination),
+                "min_consecutive_windows": int(min_consecutive_windows),
+                "new_device_setup": bool(new_device_setup),
+                "trigger_source": "dashboard_ui",
+            }
+            if use_profile_defaults and start_error:
+                st.warning(f"Profile-based start failed. Using manual values instead: {start_error}")
+            start_data, start_error = request_json(
+                f"{api_base}/api/v1/calibrate/start",
+                method="POST",
+                payload=payload,
+            )
+
         if start_error:
             st.error(f"Calibration start failed: {start_error}")
         else:
@@ -247,6 +382,22 @@ with st.sidebar:
             st.session_state.active_job_machine = selected_machine
             st.session_state.active_job_device = selected_device
             st.success(f"Calibration job started: {st.session_state.active_job_id}")
+
+    st.subheader("Profile Lifecycle")
+    confirm_profile_delete = st.toggle("Confirm profile delete", value=False)
+    if st.button("Delete selected profile", use_container_width=True):
+        if not confirm_profile_delete:
+            st.error("Enable profile delete confirmation before removing a profile.")
+        else:
+            _, delete_error = request_json(
+                f"{api_base}/api/v1/device-profiles/{selected_machine}/{selected_device}",
+                method="DELETE",
+            )
+            if delete_error:
+                st.error(f"Profile delete failed: {delete_error}")
+            else:
+                st.success(f"Deleted profile {selected_machine}/{selected_device}")
+                st.rerun()
 
 
 def render_live_ui() -> None:

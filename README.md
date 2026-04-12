@@ -103,6 +103,8 @@ python run_all.py
 - `GET /api/v1/status/{machine_id}/{device_id}`
 - `GET /api/v1/anomaly-log/{machine_id}`
 
+`POST /api/v1/stream` now routes incoming samples to the active dashboard-selected stream binding. ESP payload `machine_id` and `device_id` are accepted for compatibility and logged, but ignored for routing.
+
 ### Calibration and model
 - `POST /api/v1/calibrate`
 - `POST /api/v1/calibrate/start`
@@ -119,6 +121,10 @@ python run_all.py
 - `POST /api/v1/device-profiles`
 - `GET /api/v1/device-profiles`
 - `GET /api/v1/device-profiles/{machine_id}/{device_id}`
+- `DELETE /api/v1/device-profiles/{machine_id}/{device_id}`
+- `GET /api/v1/stream-binding`
+- `POST /api/v1/stream-binding`
+- `DELETE /api/v1/stream-binding`
 - `GET /api/v1/debug/logs`
 - `WS /api/v1/ws/live`
 
@@ -161,6 +167,18 @@ curl -X POST http://localhost:8000/api/v1/calibrate/start \
         "min_consecutive_windows":3,
         "new_device_setup":true,
         "trigger_source":"dashboard_ui"
+    }'
+```
+
+### Associate incoming stream to a profile
+
+```bash
+curl -X POST http://localhost:8000/api/v1/stream-binding \
+    -H "Content-Type: application/json" \
+    -d '{
+        "machine_id":"Fan_1",
+        "device_id":"esp32_fan_1",
+        "source":"dashboard_manual"
     }'
 ```
 

@@ -31,6 +31,8 @@ from backend.models import (
     CalibrationStartResponse,
     DeviceProfileResponse,
     DeviceProfileUpsertRequest,
+    StreamBindingResponse,
+    StreamBindingUpsertRequest,
     StreamIngestRequest,
 )
 from backend.debug_dashboard import get_debug_dashboard_html
@@ -43,6 +45,8 @@ DEBUG_SAMPLE_RATE = max(0.0, min(1.0, float(os.getenv("MACHINOCARE_DEBUG_SAMPLE_
 DEBUG_RETENTION_DAYS = int(os.getenv("MACHINOCARE_DEBUG_RETENTION_DAYS", "30"))
 DEBUG_MAX_BODY_BYTES = int(os.getenv("MACHINOCARE_DEBUG_MAX_BODY_BYTES", "20000"))
 LIVE_PUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("MACHINOCARE_LIVE_PUSH_INTERVAL_SECONDS", "0.75")))
+UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
+UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
 
 store = DataStore(db_path=DB_PATH, max_buffer_size=BUFFER_SIZE, database_url=DATABASE_URL)
 
@@ -251,6 +255,26 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def get_active_stream_binding() -> dict[str, Any] | None:
+    binding = store.get_stream_binding()
+    if not binding or not binding.get("is_active"):
+        return None
+
+    machine_id = binding.get("machine_id")
+    device_id = binding.get("device_id")
+    if not machine_id or not device_id:
+        return None
+
+    return binding
+
+
+def resolve_stream_target(_: StreamIngestRequest) -> tuple[str, str, dict[str, Any] | None]:
+    binding = get_active_stream_binding()
+    if binding:
+        return str(binding["machine_id"]), str(binding["device_id"]), binding
+    return UNASSIGNED_MACHINE_ID, UNASSIGNED_DEVICE_ID, None
 
 
 def sample_to_record(sample: Any) -> dict[str, Any]:
@@ -583,10 +607,14 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
     if len(samples) > 4000:
         raise HTTPException(status_code=413, detail="Payload too large. Reduce batch size.")
 
-    store.add_samples(payload.machine_id, payload.device_id, samples)
+    reported_machine_id = payload.machine_id
+    reported_device_id = payload.device_id
+    machine_id, device_id, binding = resolve_stream_target(payload)
 
-    state = store.get_machine_state(payload.machine_id, payload.device_id)
-    model_package = store.get_model_package(payload.machine_id, payload.device_id)
+    store.add_samples(machine_id, device_id, samples)
+
+    state = store.get_machine_state(machine_id, device_id)
+    model_package = store.get_model_package(machine_id, device_id)
 
     last_sample = samples[-1]
     score: float | None = None
@@ -597,8 +625,8 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
     if model_package:
         window_size = int(model_package.get("effective_window_size", 25))
         recent = store.get_recent_samples(
-            payload.machine_id,
-            device_id=payload.device_id,
+            machine_id,
+            device_id=device_id,
             limit=max(window_size * 2, window_size),
         )
         feature_vector = latest_feature_vector(recent, window_size)
@@ -618,8 +646,8 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
             is_anomaly = consecutive >= min_windows
             if is_anomaly and not prev_anomaly:
                 store.record_anomaly(
-                    machine_id=payload.machine_id,
-                    device_id=payload.device_id,
+                    machine_id=machine_id,
+                    device_id=device_id,
                     timestamp=last_sample["timestamp"],
                     acc_mag=last_sample["acc_mag"],
                     score=score,
@@ -635,8 +663,8 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
             consecutive = 1 if is_anomaly else 0
             if is_anomaly and not prev_anomaly:
                 store.record_anomaly(
-                    machine_id=payload.machine_id,
-                    device_id=payload.device_id,
+                    machine_id=machine_id,
+                    device_id=device_id,
                     timestamp=last_sample["timestamp"],
                     acc_mag=last_sample["acc_mag"],
                     score=None,
@@ -648,12 +676,12 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
     if state_threshold is None and model_package:
         state_threshold = float(model_package.get("decision_threshold"))
 
-    active_job = _active_calibration_for_device(payload.machine_id, payload.device_id)
+    active_job = _active_calibration_for_device(machine_id, device_id)
 
     new_state = {
         **state,
-        "machine_id": payload.machine_id,
-        "device_id": payload.device_id,
+        "machine_id": machine_id,
+        "device_id": device_id,
         "last_update": last_sample["timestamp"],
         "current_acc_mag": round(last_sample["acc_mag"], 6),
         "current_gyro_mag": round(last_sample.get("gyro_mag", 0.0), 6),
@@ -667,18 +695,25 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
         "calibration_stage": active_job["stage"] if active_job else state.get("calibration_stage"),
         "calibration_message": active_job["message"] if active_job else state.get("calibration_message"),
         "active_calibration_job_id": active_job["job_id"] if active_job else state.get("active_calibration_job_id"),
+        "reported_machine_id": reported_machine_id,
+        "reported_device_id": reported_device_id,
     }
-    store.set_machine_state(payload.machine_id, payload.device_id, new_state)
+    store.set_machine_state(machine_id, device_id, new_state)
+
+    binding_view = StreamBindingResponse(**binding).model_dump() if binding else None
 
     return {
         "status": "queued",
-        "machine_id": payload.machine_id,
-        "device_id": payload.device_id,
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "reported_machine_id": reported_machine_id,
+        "reported_device_id": reported_device_id,
         "received_samples": len(samples),
         "server_timestamp": utc_iso_now(),
         "is_anomaly": is_anomaly,
         "score": round(score, 6) if score is not None else None,
         "decision_threshold": round(state_threshold, 6) if state_threshold is not None else None,
+        "stream_binding": binding_view,
         "calibration": {
             "in_progress": bool(active_job),
             "job_id": active_job["job_id"] if active_job else None,
@@ -929,6 +964,40 @@ def devices(machine_id: str) -> dict[str, Any]:
     }
 
 
+@router.get("/stream-binding", response_model=StreamBindingResponse)
+def get_stream_binding() -> StreamBindingResponse:
+    binding = store.get_stream_binding()
+    if not binding:
+        return StreamBindingResponse(binding_name="primary", is_active=False)
+    return StreamBindingResponse(**binding)
+
+
+@router.post("/stream-binding", response_model=StreamBindingResponse)
+def upsert_stream_binding(payload: StreamBindingUpsertRequest) -> StreamBindingResponse:
+    profile = store.get_device_profile(payload.machine_id, payload.device_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Cannot bind stream: profile not found for "
+                f"machine '{payload.machine_id}', device '{payload.device_id}'."
+            ),
+        )
+
+    binding = store.set_stream_binding(
+        machine_id=payload.machine_id,
+        device_id=payload.device_id,
+        source=payload.source,
+    )
+    return StreamBindingResponse(**binding)
+
+
+@router.delete("/stream-binding", response_model=StreamBindingResponse)
+def clear_stream_binding(source: str = Query(default="dashboard_manual")) -> StreamBindingResponse:
+    binding = store.clear_stream_binding(source=source)
+    return StreamBindingResponse(**binding)
+
+
 @router.post("/device-profiles", response_model=DeviceProfileResponse)
 def upsert_device_profile(payload: DeviceProfileUpsertRequest) -> DeviceProfileResponse:
     profile = store.upsert_device_profile(payload.model_dump())
@@ -961,6 +1030,22 @@ def list_device_profiles(
     }
 
 
+@router.delete("/device-profiles/{machine_id}/{device_id}")
+def delete_device_profile(machine_id: str, device_id: str) -> dict[str, Any]:
+    deleted = store.delete_device_profile(machine_id, device_id)
+    if not deleted:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Device profile not found for machine '{machine_id}', device '{device_id}'.",
+        )
+
+    return {
+        "status": "deleted",
+        "machine_id": machine_id,
+        "device_id": device_id,
+    }
+
+
 @router.get("/debug/logs")
 def debug_logs(
     machine_id: str | None = Query(default=None),
@@ -987,8 +1072,12 @@ def debug_logs(
 async def ws_live(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    machine_id = websocket.query_params.get("machine_id") or "Fan_1"
-    device_id = websocket.query_params.get("device_id")
+    initial_binding = get_active_stream_binding()
+    default_machine_id = str(initial_binding["machine_id"]) if initial_binding else UNASSIGNED_MACHINE_ID
+    default_device_id = str(initial_binding["device_id"]) if initial_binding else None
+
+    machine_id = websocket.query_params.get("machine_id") or default_machine_id
+    device_id = websocket.query_params.get("device_id") or default_device_id
     lookback_seconds = _bounded_int(
         websocket.query_params.get("lookback_seconds"),
         default=120,
@@ -1008,6 +1097,7 @@ async def ws_live(websocket: WebSocket) -> None:
             "type": "connected",
             "machine_id": machine_id,
             "device_id": device_id,
+            "active_stream_binding": StreamBindingResponse(**initial_binding).model_dump() if initial_binding else None,
             "server_timestamp": utc_iso_now(),
         }
     )
@@ -1083,6 +1173,8 @@ async def ws_live(websocket: WebSocket) -> None:
         except HTTPException:
             status_payload = None
 
+        active_binding = get_active_stream_binding()
+
         await websocket.send_json(
             {
                 "type": "snapshot",
@@ -1091,6 +1183,9 @@ async def ws_live(websocket: WebSocket) -> None:
                 "server_timestamp": utc_iso_now(),
                 "latest_sample": latest_sample,
                 "status": status_payload,
+                "active_stream_binding": (
+                    StreamBindingResponse(**active_binding).model_dump() if active_binding else None
+                ),
                 "new_logs": [ApiDebugLogEntry(**item).model_dump() for item in new_logs],
             }
         )

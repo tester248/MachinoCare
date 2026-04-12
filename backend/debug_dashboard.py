@@ -221,6 +221,11 @@ def get_debug_dashboard_html() -> str:
           <button id=\"saveProfileBtn\" class=\"primary\">Save Profile</button>
           <button id=\"startCalibBtn\">Start Calibration</button>
         </div>
+        <div class=\"row\">
+          <button id=\"associateBtn\" class=\"primary\">Associate Stream</button>
+          <button id=\"clearAssocBtn\">Clear Association</button>
+          <button id=\"deleteProfileBtn\">Delete Profile</button>
+        </div>
         <div class=\"row\"><label for=\"displayName\">Display name</label><input id=\"displayName\" style=\"min-width:220px;\" /></div>
         <div class=\"row\"><label for=\"sr\">sample_rate_hz</label><input id=\"sr\" type=\"number\" value=\"10\" min=\"1\" max=\"500\" /></div>
         <div class=\"row\"><label for=\"ws\">window_seconds</label><input id=\"ws\" type=\"number\" value=\"1\" min=\"1\" max=\"10\" /></div>
@@ -233,6 +238,7 @@ def get_debug_dashboard_html() -> str:
             <textarea id=\"notes\"></textarea>
           </div>
         </div>
+        <div class=\"hint\" id=\"bindingHint\">Active stream association: none.</div>
         <div class=\"hint\" id=\"profileHint\">Profile actions target current machine/device.</div>
       </section>
 
@@ -464,9 +470,13 @@ def get_debug_dashboard_html() -> str:
 
       ws.onmessage = (evt) => {
         const packet = JSON.parse(evt.data);
+        if (packet.type === 'connected') {
+          updateBindingHint(packet.active_stream_binding || null);
+        }
         if (packet.type === 'snapshot') {
           if (packet.latest_sample) appendSample(packet.latest_sample, packet.status || null);
           if (packet.status) updateStatus(packet.status);
+          updateBindingHint(packet.active_stream_binding || null);
           mergeLogs(packet.new_logs || []);
           renderChart();
         }
@@ -478,6 +488,29 @@ def get_debug_dashboard_html() -> str:
 
       ws.onclose = () => setConnState('disconnected', 'warn');
       ws.onerror = () => setConnState('error', 'bad');
+    }
+
+    function updateBindingHint(binding) {
+      if (binding && binding.is_active && binding.machine_id && binding.device_id) {
+        el('bindingHint').textContent = `Active stream association: ${binding.machine_id}/${binding.device_id}`;
+        return;
+      }
+      el('bindingHint').textContent = 'Active stream association: none.';
+    }
+
+    async function refreshBinding() {
+      const response = await fetch('/api/v1/stream-binding');
+      if (!response.ok) {
+        updateBindingHint(null);
+        return;
+      }
+
+      const binding = await response.json();
+      updateBindingHint(binding);
+      if (binding && binding.is_active && binding.machine_id && binding.device_id) {
+        el('machine').value = String(binding.machine_id);
+        el('device').value = String(binding.device_id);
+      }
     }
 
     async function loadProfile() {
@@ -546,6 +579,64 @@ def get_debug_dashboard_html() -> str:
       el('profileHint').textContent = `Calibration job ${payload.job_id} (${payload.status})`;
     }
 
+    async function associateStream() {
+      const payload = {
+        machine_id: el('machine').value.trim(),
+        device_id: el('device').value.trim(),
+        source: 'debug_dashboard',
+      };
+
+      const response = await fetch('/api/v1/stream-binding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        el('profileHint').textContent = `Association failed: ${text}`;
+        return;
+      }
+
+      const binding = JSON.parse(text);
+      updateBindingHint(binding);
+      el('profileHint').textContent = `Incoming stream now routes to ${binding.machine_id}/${binding.device_id}`;
+    }
+
+    async function clearAssociation() {
+      const response = await fetch('/api/v1/stream-binding?source=debug_dashboard', {
+        method: 'DELETE',
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        el('profileHint').textContent = `Clear association failed: ${text}`;
+        return;
+      }
+
+      const binding = JSON.parse(text);
+      updateBindingHint(binding);
+      el('profileHint').textContent = 'Incoming stream association cleared.';
+    }
+
+    async function deleteProfile() {
+      const machine = el('machine').value.trim();
+      const device = el('device').value.trim();
+      if (!window.confirm(`Delete profile ${machine}/${device}?`)) {
+        return;
+      }
+
+      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(machine)}/${encodeURIComponent(device)}`, {
+        method: 'DELETE'
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        el('profileHint').textContent = `Delete failed: ${text}`;
+        return;
+      }
+
+      await refreshBinding();
+      el('profileHint').textContent = `Deleted profile ${machine}/${device}`;
+    }
+
     function disconnectLive() {
       if (ws) {
         ws.close();
@@ -558,12 +649,16 @@ def get_debug_dashboard_html() -> str:
       renderFieldControls();
       renderChart();
       setConnState('disconnected', 'warn');
+      refreshBinding();
 
       el('connectBtn').addEventListener('click', connectLive);
       el('disconnectBtn').addEventListener('click', disconnectLive);
       el('loadProfileBtn').addEventListener('click', loadProfile);
       el('saveProfileBtn').addEventListener('click', saveProfile);
       el('startCalibBtn').addEventListener('click', startCalibration);
+      el('associateBtn').addEventListener('click', associateStream);
+      el('clearAssocBtn').addEventListener('click', clearAssociation);
+      el('deleteProfileBtn').addEventListener('click', deleteProfile);
     }
 
     init();

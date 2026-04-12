@@ -44,7 +44,7 @@ class StreamIngestRequest(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    machine_id: str = Field(min_length=1, max_length=64)
+    machine_id: str = Field(default="esp_reported_machine", min_length=1, max_length=64)
     device_id: str = Field(default="esp32_unknown", min_length=1, max_length=64)
     sample: Optional[StreamSample] = None
     samples: Optional[List[StreamSample]] = None
@@ -152,6 +152,21 @@ class DeviceProfileResponse(BaseModel):
     notes: str | None = None
     created_at: str
     updated_at: str
+
+
+class StreamBindingUpsertRequest(BaseModel):
+    machine_id: str = Field(min_length=1, max_length=64)
+    device_id: str = Field(min_length=1, max_length=64)
+    source: str = Field(default="dashboard_manual", min_length=1, max_length=64)
+
+
+class StreamBindingResponse(BaseModel):
+    binding_name: str
+    machine_id: str | None = None
+    device_id: str | None = None
+    source: str | None = None
+    is_active: bool = False
+    updated_at: str | None = None
 
 
 class ApiDebugLogEntry(BaseModel):
