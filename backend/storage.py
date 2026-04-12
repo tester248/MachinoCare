@@ -18,24 +18,35 @@ except ImportError:  # pragma: no cover - optional runtime dependency
 
 
 class _CursorAdapter:
-    def __init__(self, cursor: Any) -> None:
-        self._cursor = cursor
+    def __init__(self, rows: list[Any] | None, rowcount: int) -> None:
+        self._rows = rows or []
+        self._rowcount = rowcount
+        self._index = 0
 
     def fetchall(self) -> Any:
-        return self._cursor.fetchall()
+        if self._index >= len(self._rows):
+            return []
+        out = self._rows[self._index :]
+        self._index = len(self._rows)
+        return out
 
     def fetchone(self) -> Any:
-        return self._cursor.fetchone()
+        if self._index >= len(self._rows):
+            return None
+        item = self._rows[self._index]
+        self._index += 1
+        return item
 
     @property
     def rowcount(self) -> int:
-        return int(getattr(self._cursor, "rowcount", 0) or 0)
+        return int(self._rowcount or 0)
 
 
 class _DbConnectionAdapter:
     def __init__(self, db_path: str, database_url: str | None = None) -> None:
         self.database_url = database_url or os.getenv("DATABASE_URL")
         self.backend = "sqlite"
+        self._db_lock = threading.Lock()
 
         if self.database_url and self.database_url.startswith(("postgres://", "postgresql://")):
             if psycopg is None:
@@ -57,11 +68,14 @@ class _DbConnectionAdapter:
         self._conn.execute("PRAGMA journal_mode=WAL;")
 
     def __enter__(self) -> "_DbConnectionAdapter":
-        self._conn.__enter__()
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
-        return self._conn.__exit__(exc_type, exc, tb)
+        if exc_type is None:
+            self._conn.commit()
+        else:
+            self._conn.rollback()
+        return False
 
     def _sql(self, query: str) -> str:
         if self.backend == "postgres":
@@ -69,12 +83,24 @@ class _DbConnectionAdapter:
         return query
 
     def execute(self, query: str, params: tuple[Any, ...] | list[Any] = ()) -> _CursorAdapter:
-        cursor = self._conn.execute(self._sql(query), params)
-        return _CursorAdapter(cursor)
+        with self._db_lock:
+            cursor = self._conn.cursor()
+            cursor.execute(self._sql(query), params)
+            if cursor.description is None:
+                rows: list[Any] = []
+            else:
+                rows = cursor.fetchall()
+            rowcount = int(getattr(cursor, "rowcount", 0) or 0)
+            cursor.close()
+        return _CursorAdapter(rows, rowcount)
 
     def executemany(self, query: str, rows: list[tuple[Any, ...]]) -> _CursorAdapter:
-        cursor = self._conn.executemany(self._sql(query), rows)
-        return _CursorAdapter(cursor)
+        with self._db_lock:
+            cursor = self._conn.cursor()
+            cursor.executemany(self._sql(query), rows)
+            rowcount = int(getattr(cursor, "rowcount", 0) or 0)
+            cursor.close()
+        return _CursorAdapter([], rowcount)
 
 
 class DataStore:
