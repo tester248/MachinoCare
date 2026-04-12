@@ -3,12 +3,12 @@ from __future__ import annotations
 
 def get_debug_dashboard_html() -> str:
     return """<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>MachinoCare Realtime Debug Dashboard</title>
-  <script src=\"https://cdn.plot.ly/plotly-2.35.2.min.js\"></script>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     :root {
       --bg: radial-gradient(circle at 15% 10%, #eef7ff 0%, #f8f3e1 42%, #eef8f2 100%);
@@ -24,7 +24,7 @@ def get_debug_dashboard_html() -> str:
 
     body {
       margin: 0;
-      font-family: \"Segoe UI\", Tahoma, Geneva, Verdana, sans-serif;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
       color: var(--ink);
       background: var(--bg);
     }
@@ -166,7 +166,7 @@ def get_debug_dashboard_html() -> str:
     pre {
       margin: 0;
       white-space: pre-wrap;
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, \"Liberation Mono\", \"Courier New\", monospace;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       font-size: 0.77rem;
       line-height: 1.35;
     }
@@ -180,74 +180,74 @@ def get_debug_dashboard_html() -> str:
   </style>
 </head>
 <body>
-  <div class=\"wrap\">
+  <div class="wrap">
     <h1>MachinoCare Realtime Debug Dashboard</h1>
-    <p class=\"sub\">No-flicker live dashboard for backend + ESP telemetry. Current firmware stays unchanged.</p>
+    <p class="sub">No-flicker live dashboard for backend + ESP telemetry. Current firmware stays unchanged.</p>
 
-    <div class=\"grid\">
-      <section class=\"card controls\">
-        <div class=\"row\">
-          <label for=\"machine\">Machine</label>
-          <input id=\"machine\" value=\"Fan_1\" />
-          <label for=\"device\">Device</label>
-          <input id=\"device\" value=\"esp32_fan_1\" />
-          <label for=\"lookback\">Lookback seconds</label>
-          <input id=\"lookback\" type=\"number\" value=\"120\" min=\"10\" max=\"86400\" />
-          <button id=\"connectBtn\" class=\"primary\">Connect Live Feed</button>
-          <button id=\"disconnectBtn\">Disconnect</button>
-          <span id=\"connState\" class=\"pill warn\">disconnected</span>
+    <div class="grid">
+      <section class="card controls">
+        <div class="row">
+          <label for="profileSelect">Profile</label>
+          <select id="profileSelect" style="min-width:260px;"></select>
+          <span id="profileSwitching" class="hint" style="display:none;">Switching profile...</span>
+          <label for="lookback">Lookback seconds</label>
+          <input id="lookback" type="number" value="120" min="10" max="86400" />
+          <button id="connectBtn" class="primary">Connect Live Feed</button>
+          <button id="disconnectBtn">Disconnect</button>
+          <span id="connState" class="pill warn">disconnected</span>
         </div>
-        <div class=\"row\" id=\"fieldControls\"></div>
+        <div class="row" id="fieldControls"></div>
       </section>
 
-      <section class=\"card status\">
-        <div class=\"mini\">
-          <div class=\"m\"><div class=\"k\">Health</div><div class=\"v\" id=\"statusLabel\">UNKNOWN</div></div>
-          <div class=\"m\"><div class=\"k\">Acc</div><div class=\"v\" id=\"accVal\">n/a</div></div>
-          <div class=\"m\"><div class=\"k\">Score</div><div class=\"v\" id=\"scoreVal\">n/a</div></div>
-          <div class=\"m\"><div class=\"k\">Threshold</div><div class=\"v\" id=\"thrVal\">n/a</div></div>
-          <div class=\"m\"><div class=\"k\">Calibration</div><div class=\"v\" id=\"calibVal\">idle</div></div>
+      <section class="card status">
+        <div class="mini">
+          <div class="m"><div class="k">Health</div><div class="v" id="statusLabel">UNKNOWN</div></div>
+          <div class="m"><div class="k">Acc</div><div class="v" id="accVal">n/a</div></div>
+          <div class="m"><div class="k">Score</div><div class="v" id="scoreVal">n/a</div></div>
+          <div class="m"><div class="k">Threshold</div><div class="v" id="thrVal">n/a</div></div>
+          <div class="m"><div class="k">Calibration</div><div class="v" id="calibVal">idle</div></div>
         </div>
       </section>
 
-      <section class=\"card chart\">
-        <div id=\"chart\" style=\"height:420px;\"></div>
+      <section class="card chart">
+        <div id="chart" style="height:420px;"></div>
       </section>
 
-      <section class=\"card profiles\">
-        <h3 style=\"margin:0 0 0.5rem;\">Device Profile + Calibration</h3>
-        <div class=\"row\">
-          <button id=\"loadProfileBtn\">Load Profile</button>
-          <button id=\"saveProfileBtn\" class=\"primary\">Save Profile</button>
-          <button id=\"startCalibBtn\">Start Calibration</button>
+      <section class="card profiles">
+        <h3 style="margin:0 0 0.5rem;">Device Profile + Calibration</h3>
+        <div class="row">
+          <button id="saveProfileBtn" class="primary">Save Profile</button>
+          <button id="startCalibBtn">Start Calibration</button>
+          <button id="reloadProfilesBtn">Reload Profiles</button>
         </div>
-        <div class=\"row\">
-          <button id=\"associateBtn\" class=\"primary\">Associate Stream</button>
-          <button id=\"clearAssocBtn\">Clear Association</button>
-          <button id=\"deleteProfileBtn\">Delete Profile</button>
+        <div class="row">
+          <button id="associateBtn" class="primary">Associate Stream</button>
+          <button id="clearAssocBtn">Clear Association</button>
+          <button id="deleteProfileBtn">Delete Profile</button>
         </div>
-        <div class=\"row\"><label for=\"displayName\">Display name</label><input id=\"displayName\" style=\"min-width:220px;\" /></div>
-        <div class=\"row\"><label for=\"sr\">sample_rate_hz</label><input id=\"sr\" type=\"number\" value=\"10\" min=\"1\" max=\"500\" /></div>
-        <div class=\"row\"><label for=\"ws\">window_seconds</label><input id=\"ws\" type=\"number\" value=\"1\" min=\"1\" max=\"10\" /></div>
-        <div class=\"row\"><label for=\"fb\">fallback_seconds</label><input id=\"fb\" type=\"number\" value=\"300\" min=\"10\" max=\"86400\" /></div>
-        <div class=\"row\"><label for=\"cont\">contamination</label><input id=\"cont\" type=\"number\" value=\"0.05\" min=\"0.01\" max=\"0.40\" step=\"0.01\" /></div>
-        <div class=\"row\"><label for=\"minw\">min_consecutive_windows</label><input id=\"minw\" type=\"number\" value=\"3\" min=\"1\" max=\"10\" /></div>
-        <div class=\"row\" style=\"align-items:flex-start;\">
-          <div style=\"width:100%;\">
-            <label for=\"notes\">notes</label>
-            <textarea id=\"notes\"></textarea>
+        <div class="row"><label for="displayName">Display name</label><input id="displayName" style="min-width:220px;" /></div>
+        <div class="row"><label for="newDisplayName">New profile</label><input id="newDisplayName" style="min-width:220px;" /><button id="createProfileBtn">Create Profile</button></div>
+        <div class="row"><label for="sr">sample_rate_hz</label><input id="sr" type="number" value="10" min="1" max="500" /></div>
+        <div class="row"><label for="ws">window_seconds</label><input id="ws" type="number" value="1" min="1" max="10" /></div>
+        <div class="row"><label for="fb">fallback_seconds</label><input id="fb" type="number" value="300" min="10" max="86400" /></div>
+        <div class="row"><label for="cont">contamination</label><input id="cont" type="number" value="0.05" min="0.01" max="0.40" step="0.01" /></div>
+        <div class="row"><label for="minw">min_consecutive_windows</label><input id="minw" type="number" value="3" min="1" max="10" /></div>
+        <div class="row" style="align-items:flex-start;">
+          <div style="width:100%;">
+            <label for="notes">notes</label>
+            <textarea id="notes"></textarea>
           </div>
         </div>
-        <div class=\"hint\" id=\"bindingHint\">Active stream association: none.</div>
-        <div class=\"hint\" id=\"profileHint\">Profile actions target current machine/device.</div>
+        <div class="hint" id="bindingHint">Active stream association: none.</div>
+        <div class="hint" id="profileHint">Select a profile by display name to manage settings.</div>
       </section>
 
-      <section class=\"card logs\">
-        <div class=\"row\" style=\"justify-content:space-between;\">
-          <h3 style=\"margin:0;\">Live API Logs (ESP/backend)</h3>
-          <span class=\"hint\">Newest first. Click a row to inspect payloads.</span>
+      <section class="card logs">
+        <div class="row" style="justify-content:space-between;">
+          <h3 style="margin:0;">Live API Logs (ESP/backend)</h3>
+          <span class="hint">Newest first. Click a row to inspect payloads.</span>
         </div>
-        <div class=\"scroll\">
+        <div class="scroll">
           <table>
             <thead>
               <tr>
@@ -260,15 +260,15 @@ def get_debug_dashboard_html() -> str:
                 <th>Device</th>
               </tr>
             </thead>
-            <tbody id=\"logsBody\"></tbody>
+            <tbody id="logsBody"></tbody>
           </table>
         </div>
       </section>
 
-      <section class=\"card payload\">
-        <h3 style=\"margin:0 0 0.5rem;\">Selected Log Payload</h3>
-        <div class=\"scroll\" style=\"max-height:360px;\">
-          <pre id=\"payloadView\">Select a log row to inspect request/response payloads.</pre>
+      <section class="card payload">
+        <h3 style="margin:0 0 0.5rem;">Selected Log Payload</h3>
+        <div class="scroll" style="max-height:360px;">
+          <pre id="payloadView">Select a log row to inspect request/response payloads.</pre>
         </div>
       </section>
     </div>
@@ -289,12 +289,35 @@ def get_debug_dashboard_html() -> str:
     const traces = {};
     const timestamps = [];
     const logs = [];
+    const profilesByKey = new Map();
 
     let ws = null;
     let lastTimestamp = '';
     let lastLogId = 0;
+    let activeProfileKey = '';
 
     function el(id) { return document.getElementById(id); }
+
+    function profileKey(machine, device) {
+      return `${String(machine || '').trim()}::${String(device || '').trim()}`;
+    }
+
+    function slugifyName(name) {
+      const slug = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+      return slug || 'profile';
+    }
+
+    function currentProfile() {
+      if (!activeProfileKey) return null;
+      return profilesByKey.get(activeProfileKey) || null;
+    }
+
+    function setProfileSwitching(active, text) {
+      const node = el('profileSwitching');
+      if (!node) return;
+      node.style.display = active ? 'inline-block' : 'none';
+      node.textContent = text || 'Switching profile...';
+    }
 
     function toWsUrl(machine, device, lookback) {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -318,13 +341,38 @@ def get_debug_dashboard_html() -> str:
       for (const field of fieldConfig) {
         const id = `f_${field.key}`;
         const wrap = document.createElement('span');
-        wrap.innerHTML = `<label style=\"display:flex; align-items:center; gap:0.25rem;\"><input id=\"${id}\" type=\"checkbox\" checked/>${field.label}</label>`;
+        wrap.innerHTML = `<label style="display:flex; align-items:center; gap:0.25rem;"><input id="${id}" type="checkbox" checked/>${field.label}</label>`;
         root.appendChild(wrap);
         setTimeout(() => {
           const control = el(id);
           if (control) control.addEventListener('change', renderChart);
         }, 0);
       }
+    }
+
+    function clearProfileForm() {
+      el('displayName').value = '';
+      el('sr').value = 10;
+      el('ws').value = 1;
+      el('fb').value = 300;
+      el('cont').value = 0.05;
+      el('minw').value = 3;
+      el('notes').value = '';
+    }
+
+    function applyProfileToForm(profile) {
+      if (!profile) {
+        clearProfileForm();
+        return;
+      }
+
+      el('displayName').value = profile.display_name || profile.display_label || '';
+      el('sr').value = profile.sample_rate_hz ?? 10;
+      el('ws').value = profile.window_seconds ?? 1;
+      el('fb').value = profile.fallback_seconds ?? 300;
+      el('cont').value = profile.contamination ?? 0.05;
+      el('minw').value = profile.min_consecutive_windows ?? 3;
+      el('notes').value = profile.notes || '';
     }
 
     function appendSample(sample, status) {
@@ -450,9 +498,91 @@ def get_debug_dashboard_html() -> str:
       };
     }
 
+    function updateBindingHint(binding) {
+      if (binding && binding.is_active && binding.machine_id && binding.device_id) {
+        const key = profileKey(binding.machine_id, binding.device_id);
+        const profile = profilesByKey.get(key);
+        const label = profile ? profile.display_label : `${binding.machine_id}/${binding.device_id}`;
+        el('bindingHint').textContent = `Active stream association: ${label}`;
+        return;
+      }
+      el('bindingHint').textContent = 'Active stream association: none.';
+    }
+
+    async function refreshBinding() {
+      const response = await fetch('/api/v1/stream-binding');
+      if (!response.ok) {
+        updateBindingHint(null);
+        return null;
+      }
+
+      const binding = await response.json();
+      updateBindingHint(binding);
+      return binding;
+    }
+
+    async function loadProfiles(preferredKey = '') {
+      setProfileSwitching(true, 'Loading profiles...');
+      const select = el('profileSelect');
+      select.innerHTML = '';
+      profilesByKey.clear();
+
+      const response = await fetch('/api/v1/device-profiles?limit=500');
+      if (!response.ok) {
+        activeProfileKey = '';
+        clearProfileForm();
+        el('profileHint').textContent = 'Failed to load profiles.';
+        setProfileSwitching(false);
+        return;
+      }
+
+      const data = await response.json();
+      const rows = Array.isArray(data.profiles) ? data.profiles : [];
+      const nameCounts = new Map();
+
+      rows.forEach((row, index) => {
+        const machine = String(row.machine_id || '').trim();
+        const device = String(row.device_id || '').trim();
+        if (!machine || !device) return;
+
+        const base = String(row.display_name || '').trim() || `Unnamed profile ${index + 1}`;
+        const count = (nameCounts.get(base) || 0) + 1;
+        nameCounts.set(base, count);
+        const display_label = count === 1 ? base : `${base} #${count}`;
+        const key = profileKey(machine, device);
+
+        const profile = { ...row, machine_id: machine, device_id: device, key, display_label };
+        profilesByKey.set(key, profile);
+        select.add(new Option(display_label, key));
+      });
+
+      if (profilesByKey.size === 0) {
+        activeProfileKey = '';
+        clearProfileForm();
+        el('profileHint').textContent = 'No profiles found. Create one to begin.';
+        setProfileSwitching(false);
+        return;
+      }
+
+      let nextKey = preferredKey && profilesByKey.has(preferredKey) ? preferredKey : activeProfileKey;
+      if (!profilesByKey.has(nextKey)) {
+        nextKey = select.options[0].value;
+      }
+      select.value = nextKey;
+      activeProfileKey = nextKey;
+      applyProfileToForm(currentProfile());
+      setProfileSwitching(false);
+    }
+
     function connectLive() {
-      const machine = el('machine').value.trim() || 'Fan_1';
-      const device = el('device').value.trim() || '';
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select or create a profile first.';
+        return;
+      }
+
+      const machine = profile.machine_id;
+      const device = profile.device_id;
       const lookback = Number(el('lookback').value || 120);
 
       if (ws) {
@@ -486,57 +616,35 @@ def get_debug_dashboard_html() -> str:
         }
       };
 
-      ws.onclose = () => setConnState('disconnected', 'warn');
+      ws.onclose = () => {
+        ws = null;
+        setConnState('disconnected', 'warn');
+      };
       ws.onerror = () => setConnState('error', 'bad');
     }
 
-    function updateBindingHint(binding) {
-      if (binding && binding.is_active && binding.machine_id && binding.device_id) {
-        el('bindingHint').textContent = `Active stream association: ${binding.machine_id}/${binding.device_id}`;
-        return;
-      }
-      el('bindingHint').textContent = 'Active stream association: none.';
-    }
+    async function onProfileSelectionChange() {
+      const key = el('profileSelect').value;
+      if (!key || !profilesByKey.has(key)) return;
 
-    async function refreshBinding() {
-      const response = await fetch('/api/v1/stream-binding');
-      if (!response.ok) {
-        updateBindingHint(null);
-        return;
-      }
-
-      const binding = await response.json();
-      updateBindingHint(binding);
-      if (binding && binding.is_active && binding.machine_id && binding.device_id) {
-        el('machine').value = String(binding.machine_id);
-        el('device').value = String(binding.device_id);
-      }
-    }
-
-    async function loadProfile() {
-      const machine = el('machine').value.trim();
-      const device = el('device').value.trim();
-      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(machine)}/${encodeURIComponent(device)}`);
-      if (!response.ok) {
-        el('profileHint').textContent = 'No saved profile yet for this machine/device.';
-        return;
-      }
-
-      const p = await response.json();
-      el('displayName').value = p.display_name || '';
-      el('sr').value = p.sample_rate_hz ?? 10;
-      el('ws').value = p.window_seconds ?? 1;
-      el('fb').value = p.fallback_seconds ?? 300;
-      el('cont').value = p.contamination ?? 0.05;
-      el('minw').value = p.min_consecutive_windows ?? 3;
-      el('notes').value = p.notes || '';
-      el('profileHint').textContent = `Profile loaded at ${p.updated_at}`;
+      setProfileSwitching(true, 'Switching profile...');
+      activeProfileKey = key;
+      applyProfileToForm(currentProfile());
+      await refreshBinding();
+      if (ws) connectLive();
+      setProfileSwitching(false);
     }
 
     async function saveProfile() {
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select a profile before saving.';
+        return;
+      }
+
       const payload = {
-        machine_id: el('machine').value.trim(),
-        device_id: el('device').value.trim(),
+        machine_id: profile.machine_id,
+        device_id: profile.device_id,
         display_name: el('displayName').value.trim() || null,
         sample_rate_hz: Number(el('sr').value),
         window_seconds: Number(el('ws').value),
@@ -552,20 +660,85 @@ def get_debug_dashboard_html() -> str:
         body: JSON.stringify(payload)
       });
 
+      const text = await response.text();
       if (!response.ok) {
-        const txt = await response.text();
-        el('profileHint').textContent = `Save failed: ${txt}`;
+        el('profileHint').textContent = `Save failed: ${text}`;
         return;
       }
 
-      const result = await response.json();
-      el('profileHint').textContent = `Saved profile for ${result.machine_id}/${result.device_id}`;
+      const result = JSON.parse(text);
+      const key = profileKey(result.machine_id, result.device_id);
+      await loadProfiles(key);
+      await refreshBinding();
+      el('profileHint').textContent = `Saved profile ${result.display_name || 'updated'}`;
+    }
+
+    async function createProfile() {
+      const displayName = el('newDisplayName').value.trim();
+      if (!displayName) {
+        el('profileHint').textContent = 'Enter a display name for the new profile.';
+        return;
+      }
+
+      const existingNames = Array.from(profilesByKey.values())
+        .map(item => String(item.display_name || '').trim().toLowerCase())
+        .filter(Boolean);
+      if (existingNames.includes(displayName.toLowerCase())) {
+        el('profileHint').textContent = 'A profile with that display name already exists.';
+        return;
+      }
+
+      const base = slugifyName(displayName);
+      let suffix = 1;
+      let machine = '';
+      let device = '';
+      while (true) {
+        machine = suffix === 1 ? base : `${base}_${suffix}`;
+        device = `${machine}_device`;
+        if (!profilesByKey.has(profileKey(machine, device))) break;
+        suffix += 1;
+      }
+
+      const payload = {
+        machine_id: machine,
+        device_id: device,
+        display_name: displayName,
+        sample_rate_hz: Number(el('sr').value),
+        window_seconds: Number(el('ws').value),
+        fallback_seconds: Number(el('fb').value),
+        contamination: Number(el('cont').value),
+        min_consecutive_windows: Number(el('minw').value),
+        notes: el('notes').value.trim() || null,
+      };
+
+      const response = await fetch('/api/v1/device-profiles', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+
+      const text = await response.text();
+      if (!response.ok) {
+        el('profileHint').textContent = `Create failed: ${text}`;
+        return;
+      }
+
+      const created = JSON.parse(text);
+      const key = profileKey(created.machine_id, created.device_id);
+      el('newDisplayName').value = '';
+      await loadProfiles(key);
+      await refreshBinding();
+      el('profileHint').textContent = `Created profile ${created.display_name || displayName}`;
     }
 
     async function startCalibration() {
-      const machine = el('machine').value.trim();
-      const device = el('device').value.trim();
-      const response = await fetch(`/api/v1/calibrate/start/profile/${encodeURIComponent(machine)}/${encodeURIComponent(device)}?new_device_setup=true&trigger_source=debug_dashboard`, {
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select a profile before starting calibration.';
+        return;
+      }
+
+      const response = await fetch(`/api/v1/calibrate/start/profile/${encodeURIComponent(profile.machine_id)}/${encodeURIComponent(profile.device_id)}?new_device_setup=true&trigger_source=debug_dashboard`, {
         method: 'POST'
       });
 
@@ -580,16 +753,20 @@ def get_debug_dashboard_html() -> str:
     }
 
     async function associateStream() {
-      const payload = {
-        machine_id: el('machine').value.trim(),
-        device_id: el('device').value.trim(),
-        source: 'debug_dashboard',
-      };
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select a profile before associating stream data.';
+        return;
+      }
 
       const response = await fetch('/api/v1/stream-binding', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          machine_id: profile.machine_id,
+          device_id: profile.device_id,
+          source: 'debug_dashboard',
+        }),
       });
       const text = await response.text();
       if (!response.ok) {
@@ -599,7 +776,7 @@ def get_debug_dashboard_html() -> str:
 
       const binding = JSON.parse(text);
       updateBindingHint(binding);
-      el('profileHint').textContent = `Incoming stream now routes to ${binding.machine_id}/${binding.device_id}`;
+      el('profileHint').textContent = `Incoming stream now routes to ${profile.display_label}`;
     }
 
     async function clearAssociation() {
@@ -618,13 +795,16 @@ def get_debug_dashboard_html() -> str:
     }
 
     async function deleteProfile() {
-      const machine = el('machine').value.trim();
-      const device = el('device').value.trim();
-      if (!window.confirm(`Delete profile ${machine}/${device}?`)) {
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select a profile before deleting.';
+        return;
+      }
+      if (!window.confirm(`Delete profile ${profile.display_label}?`)) {
         return;
       }
 
-      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(machine)}/${encodeURIComponent(device)}`, {
+      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(profile.machine_id)}/${encodeURIComponent(profile.device_id)}`, {
         method: 'DELETE'
       });
       const text = await response.text();
@@ -633,8 +813,11 @@ def get_debug_dashboard_html() -> str:
         return;
       }
 
+      const deletedLabel = profile.display_label;
+      await loadProfiles('');
       await refreshBinding();
-      el('profileHint').textContent = `Deleted profile ${machine}/${device}`;
+      disconnectLive();
+      el('profileHint').textContent = `Deleted profile ${deletedLabel}`;
     }
 
     function disconnectLive() {
@@ -645,16 +828,31 @@ def get_debug_dashboard_html() -> str:
       setConnState('disconnected', 'warn');
     }
 
-    function init() {
+    async function init() {
       renderFieldControls();
       renderChart();
       setConnState('disconnected', 'warn');
-      refreshBinding();
+
+      await loadProfiles('');
+      const binding = await refreshBinding();
+      if (binding && binding.is_active) {
+        const key = profileKey(binding.machine_id, binding.device_id);
+        if (profilesByKey.has(key)) {
+          activeProfileKey = key;
+          el('profileSelect').value = key;
+          applyProfileToForm(currentProfile());
+        }
+      }
 
       el('connectBtn').addEventListener('click', connectLive);
       el('disconnectBtn').addEventListener('click', disconnectLive);
-      el('loadProfileBtn').addEventListener('click', loadProfile);
+      el('profileSelect').addEventListener('change', onProfileSelectionChange);
       el('saveProfileBtn').addEventListener('click', saveProfile);
+      el('createProfileBtn').addEventListener('click', createProfile);
+      el('reloadProfilesBtn').addEventListener('click', async () => {
+        await loadProfiles(activeProfileKey);
+        await refreshBinding();
+      });
       el('startCalibBtn').addEventListener('click', startCalibration);
       el('associateBtn').addEventListener('click', associateStream);
       el('clearAssocBtn').addEventListener('click', clearAssociation);

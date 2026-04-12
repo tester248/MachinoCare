@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import re
+import time
+from datetime import datetime, timezone
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -10,6 +12,8 @@ import streamlit as st
 
 API_DEFAULT = os.getenv("MACHINOCARE_API_URL", "http://localhost:8000")
 THINGSPEAK_CHANNEL_DEFAULT = os.getenv("MACHINOCARE_THINGSPEAK_CHANNEL", "3336916")
+UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
+UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
 
 st.set_page_config(
     page_title="MachinoCare Live Control Room",
@@ -22,16 +26,32 @@ st.markdown(
     <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=IBM+Plex+Mono:wght@400;600&display=swap');
     :root {
-        --mc-bg: radial-gradient(circle at 15% 10%, #e9f6ff 0%, #f8f2dc 45%, #f3f9f0 100%);
-        --mc-card: rgba(255, 255, 255, 0.94);
-        --mc-border: rgba(16, 44, 61, 0.2);
+        --mc-bg: radial-gradient(circle at 15% 10%, #e7f2ff 0%, #f8f2dc 45%, #edf9f2 100%);
+        --mc-card: rgba(255, 255, 255, 0.96);
+        --mc-border: rgba(16, 44, 61, 0.24);
         --mc-healthy: #1b8a5a;
         --mc-alert: #d91e18;
-        --mc-ink: #0b1f2a;
-        --mc-subtle: #445b68;
-        --mc-sidebar-bg: linear-gradient(180deg, #1f2430 0%, #212634 100%);
+        --mc-ink: #0f1f2d;
+        --mc-subtle: #2d5168;
+        --mc-sidebar-bg: linear-gradient(180deg, #111a31 0%, #1b2540 100%);
         --mc-sidebar-ink: #f3f6ff;
-        --mc-sidebar-input-bg: #0a1020;
+        --mc-sidebar-input-bg: #0c1528;
+        --mc-live: #0ea5e9;
+    }
+
+    @media (prefers-color-scheme: dark) {
+        :root {
+            --mc-bg: radial-gradient(circle at 12% 8%, #0f1a30 0%, #172239 40%, #1a2f2c 100%);
+            --mc-card: rgba(16, 28, 46, 0.9);
+            --mc-border: rgba(148, 189, 216, 0.34);
+            --mc-healthy: #5de2a3;
+            --mc-alert: #ff8b8b;
+            --mc-ink: #eff8ff;
+            --mc-subtle: #c2dbe9;
+            --mc-sidebar-bg: linear-gradient(180deg, #0b1222 0%, #111933 100%);
+            --mc-sidebar-input-bg: #060d1c;
+            --mc-live: #67e8f9;
+        }
     }
 
     html, body {
@@ -47,6 +67,21 @@ st.markdown(
         background: var(--mc-bg);
     }
 
+    [data-testid="stAppViewContainer"] .main,
+    [data-testid="stAppViewContainer"] .main p,
+    [data-testid="stAppViewContainer"] .main span,
+    [data-testid="stAppViewContainer"] .main label,
+    [data-testid="stAppViewContainer"] .main h1,
+    [data-testid="stAppViewContainer"] .main h2,
+    [data-testid="stAppViewContainer"] .main h3,
+    [data-testid="stAppViewContainer"] .main h4,
+    [data-testid="stAppViewContainer"] .main h5,
+    [data-testid="stAppViewContainer"] .main h6,
+    [data-testid="stAppViewContainer"] .main li,
+    [data-testid="stAppViewContainer"] .main div {
+        color: var(--mc-ink);
+    }
+
     [data-testid="stSidebar"] {
         background: var(--mc-sidebar-bg) !important;
     }
@@ -60,7 +95,28 @@ st.markdown(
     [data-testid="stSidebar"] [data-baseweb="select"] > div,
     [data-testid="stSidebar"] [data-baseweb="input"] > div {
         background: var(--mc-sidebar-input-bg) !important;
-        border-color: rgba(173, 188, 255, 0.22) !important;
+        border-color: rgba(173, 188, 255, 0.34) !important;
+    }
+
+    [data-testid="stSidebar"] button {
+        border: 1px solid rgba(198, 217, 255, 0.45) !important;
+    }
+
+    [data-testid="stSidebar"] button:disabled {
+        opacity: 0.45;
+    }
+
+    [data-testid="stSkeleton"] {
+        display: none !important;
+    }
+
+    [data-testid="stElementOverlay"] {
+        background: transparent !important;
+    }
+
+    [data-testid="stAppViewContainer"] [data-stale='true'] {
+        opacity: 1 !important;
+        filter: none !important;
     }
 
     .mc-glass {
@@ -111,6 +167,35 @@ st.markdown(
 
     code, pre {
         font-family: 'IBM Plex Mono', monospace;
+    }
+
+    .mc-live-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.45rem;
+        border: 1px solid rgba(8, 145, 178, 0.38);
+        background: rgba(8, 145, 178, 0.12);
+        border-radius: 999px;
+        padding: 0.3rem 0.75rem;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-bottom: 0.65rem;
+        color: var(--mc-ink) !important;
+    }
+
+    .mc-live-dot {
+        width: 0.6rem;
+        height: 0.6rem;
+        border-radius: 50%;
+        background: var(--mc-live);
+        box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.7);
+        animation: mc-pulse 1.4s infinite;
+    }
+
+    @keyframes mc-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0.7); }
+        70% { box-shadow: 0 0 0 10px rgba(14, 165, 233, 0); }
+        100% { box-shadow: 0 0 0 0 rgba(14, 165, 233, 0); }
     }
     </style>
     """,
@@ -184,6 +269,39 @@ def normalize_recent_samples(samples: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def profile_key(machine_id: str, device_id: str) -> str:
+    return f"{machine_id}::{device_id}"
+
+
+def profile_display_name(profile: dict, index: int) -> str:
+    name = str(profile.get("display_name") or "").strip()
+    if name:
+        return name
+    return f"Unnamed profile {index + 1}"
+
+
+def slugify_name(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalized or "profile"
+
+
+def build_unique_profile_ids(display_name: str, existing_profiles: list[dict]) -> tuple[str, str]:
+    taken = {
+        profile_key(str(item.get("machine_id") or ""), str(item.get("device_id") or ""))
+        for item in existing_profiles
+    }
+    base = slugify_name(display_name)
+
+    suffix = 1
+    while True:
+        machine_id = base if suffix == 1 else f"{base}_{suffix}"
+        device_id = f"{machine_id}_device"
+        key = profile_key(machine_id, device_id)
+        if key not in taken:
+            return machine_id, device_id
+        suffix += 1
+
+
 if "active_job_id" not in st.session_state:
     st.session_state.active_job_id = None
 if "active_job_machine" not in st.session_state:
@@ -192,6 +310,14 @@ if "active_job_device" not in st.session_state:
     st.session_state.active_job_device = None
 if "completed_job" not in st.session_state:
     st.session_state.completed_job = None
+if "selected_profile_key" not in st.session_state:
+    st.session_state.selected_profile_key = None
+if "profile_form_loaded_for" not in st.session_state:
+    st.session_state.profile_form_loaded_for = None
+if "live_tick" not in st.session_state:
+    st.session_state.live_tick = 0
+if "session_started_at" not in st.session_state:
+    st.session_state.session_started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 st.title("MachinoCare - AI Predictive Maintenance")
 st.caption("Live vibration intelligence with backend-driven calibration and edge-safe inference.")
@@ -202,63 +328,99 @@ with st.sidebar:
 
     profiles_data, profiles_error = request_json(f"{api_base}/api/v1/device-profiles?limit=500")
     profile_rows = profiles_data.get("profiles", []) if profiles_data else []
-    profile_lookup: dict[str, tuple[str, str]] = {}
-    profile_labels: list[str] = []
-    for profile in profile_rows:
+
+    normalized_profiles: list[dict] = []
+    display_name_counts: dict[str, int] = {}
+    for idx, profile in enumerate(profile_rows):
         machine = str(profile.get("machine_id") or "").strip()
         device = str(profile.get("device_id") or "").strip()
         if not machine or not device:
             continue
-        display_name = str(profile.get("display_name") or "").strip()
-        label = f"{display_name} ({machine}/{device})" if display_name else f"{machine}/{device}"
-        profile_lookup[label] = (machine, device)
-        profile_labels.append(label)
+
+        base_name = profile_display_name(profile, idx)
+        occurrence = display_name_counts.get(base_name, 0) + 1
+        display_name_counts[base_name] = occurrence
+        display_label = base_name if occurrence == 1 else f"{base_name} #{occurrence}"
+
+        normalized_profiles.append(
+            {
+                **profile,
+                "machine_id": machine,
+                "device_id": device,
+                "display_name_raw": str(profile.get("display_name") or "").strip(),
+                "display_label": display_label,
+                "key": profile_key(machine, device),
+            }
+        )
+
+    profile_by_key = {item["key"]: item for item in normalized_profiles}
+    profile_options = [item["key"] for item in normalized_profiles]
 
     binding_data, binding_error = request_json(f"{api_base}/api/v1/stream-binding")
     active_binding = binding_data or {}
     active_binding_machine = active_binding.get("machine_id") if active_binding.get("is_active") else None
     active_binding_device = active_binding.get("device_id") if active_binding.get("is_active") else None
+    active_binding_key = (
+        profile_key(str(active_binding_machine), str(active_binding_device))
+        if active_binding_machine and active_binding_device
+        else None
+    )
 
-    if profile_labels:
-        default_label = profile_labels[0]
-        if active_binding_machine and active_binding_device:
-            for label, pair in profile_lookup.items():
-                if pair == (active_binding_machine, active_binding_device):
-                    default_label = label
-                    break
+    selected_profile: dict | None = None
+    selected_profile_label = "No profile selected"
+    if profile_options:
+        preferred_key = st.session_state.selected_profile_key
+        if active_binding_key in profile_by_key:
+            preferred_key = active_binding_key
+        if preferred_key not in profile_by_key:
+            preferred_key = profile_options[0]
 
-        selected_profile_label = st.selectbox(
-            "Profile target",
-            options=profile_labels,
-            index=profile_labels.index(default_label),
+        selected_profile_key = st.selectbox(
+            "Profile",
+            options=profile_options,
+            index=profile_options.index(preferred_key),
+            format_func=lambda key: profile_by_key[key]["display_label"],
         )
-        selected_machine, selected_device = profile_lookup[selected_profile_label]
+
+        if st.session_state.selected_profile_key != selected_profile_key:
+            with st.spinner("Switching profile..."):
+                time.sleep(0.25)
+
+        st.session_state.selected_profile_key = selected_profile_key
+        selected_profile = profile_by_key[selected_profile_key]
+        selected_profile_label = selected_profile["display_label"]
     else:
-        machines_data, _ = request_json(f"{api_base}/api/v1/machines")
-        machine_options = machines_data.get("machines", []) if machines_data else []
+        st.info("Create your first profile to start monitoring and calibration.")
+        st.session_state.selected_profile_key = None
 
-        default_machine = "Fan_1"
-        if machine_options:
-            selected_machine = st.selectbox("Machine", machine_options)
-        else:
-            selected_machine = st.text_input("Machine", default_machine)
+    selected_machine = selected_profile["machine_id"] if selected_profile else UNASSIGNED_MACHINE_ID
+    selected_device = selected_profile["device_id"] if selected_profile else UNASSIGNED_DEVICE_ID
 
-        device_data, _ = request_json(f"{api_base}/api/v1/devices/{selected_machine}")
-        device_options = device_data.get("devices", []) if device_data else []
-        default_device = "esp32_fan_1"
-        if device_options:
-            selected_device = st.selectbox("Device", device_options)
-        else:
-            selected_device = st.text_input("Device", default_device)
+    form_scope_key = selected_profile["key"] if selected_profile else "__new_profile__"
+    if st.session_state.profile_form_loaded_for != form_scope_key:
+        st.session_state.form_display_name = (
+            selected_profile.get("display_name_raw")
+            if selected_profile
+            else ""
+        )
+        st.session_state.form_sample_rate_hz = int((selected_profile or {}).get("sample_rate_hz") or 10)
+        st.session_state.form_window_seconds = int((selected_profile or {}).get("window_seconds") or 1)
+        st.session_state.form_fallback_seconds = int((selected_profile or {}).get("fallback_seconds") or 300)
+        st.session_state.form_contamination = float((selected_profile or {}).get("contamination") or 0.05)
+        st.session_state.form_min_windows = int((selected_profile or {}).get("min_consecutive_windows") or 3)
+        st.session_state.form_notes = str((selected_profile or {}).get("notes") or "")
+        st.session_state.profile_form_loaded_for = form_scope_key
 
     st.subheader("Incoming Stream Association")
-    if active_binding_machine and active_binding_device:
-        st.success(f"Incoming stream -> {active_binding_machine}/{active_binding_device}")
+    if active_binding_key and active_binding_key in profile_by_key:
+        st.success(f"Incoming stream -> {profile_by_key[active_binding_key]['display_label']}")
+    elif active_binding_machine and active_binding_device:
+        st.warning("Incoming stream is associated to a profile not currently listed.")
     else:
         st.warning("No active association. Incoming stream routes to unassigned target.")
 
     association_col, clear_col = st.columns(2)
-    if association_col.button("Associate stream", use_container_width=True):
+    if association_col.button("Associate stream", use_container_width=True, disabled=selected_profile is None):
         bind_data, bind_error = request_json(
             f"{api_base}/api/v1/stream-binding",
             method="POST",
@@ -271,10 +433,8 @@ with st.sidebar:
         if bind_error:
             st.error(f"Stream association failed: {bind_error}")
         else:
-            st.success(
-                "Incoming stream now targets "
-                f"{bind_data.get('machine_id')}/{bind_data.get('device_id')}"
-            )
+            _ = bind_data
+            st.success(f"Incoming stream now targets {selected_profile_label}")
 
     if clear_col.button("Clear association", use_container_width=True):
         _, clear_error = request_json(
@@ -294,98 +454,162 @@ with st.sidebar:
     lookback_seconds = st.slider("Live lookback (seconds)", min_value=30, max_value=600, value=120, step=10)
     refresh_seconds = st.slider("Live refresh (seconds)", min_value=1, max_value=10, value=1, step=1)
 
-    selected_profile_data, _ = request_json(
-        f"{api_base}/api/v1/device-profiles/{selected_machine}/{selected_device}"
-    )
-    default_sample_rate_hz = int((selected_profile_data or {}).get("sample_rate_hz") or 10)
-    default_window_seconds = int((selected_profile_data or {}).get("window_seconds") or 1)
-    default_fallback_seconds = int((selected_profile_data or {}).get("fallback_seconds") or 300)
-    default_contamination = float((selected_profile_data or {}).get("contamination") or 0.05)
-    default_min_windows = int((selected_profile_data or {}).get("min_consecutive_windows") or 3)
-
-    st.subheader("Calibration")
-    use_profile_defaults = st.toggle("Use saved profile settings", value=True)
+    st.subheader("Profile Settings")
+    st.text_input("Display name", key="form_display_name")
     sample_rate_hz = st.number_input(
         "Sample rate (Hz)",
         min_value=1,
         max_value=500,
-        value=default_sample_rate_hz,
         step=1,
+        key="form_sample_rate_hz",
     )
     window_seconds = st.number_input(
         "Window size (s)",
         min_value=1,
         max_value=10,
-        value=default_window_seconds,
         step=1,
+        key="form_window_seconds",
     )
     fallback_seconds = st.number_input(
         "Fallback window (s)",
         min_value=30,
         max_value=3600,
-        value=default_fallback_seconds,
         step=30,
+        key="form_fallback_seconds",
     )
     contamination = st.slider(
         "Isolation Forest contamination",
         min_value=0.01,
         max_value=0.40,
-        value=default_contamination,
         step=0.01,
+        key="form_contamination",
     )
     min_consecutive_windows = st.number_input(
         "Min consecutive windows",
         min_value=1,
         max_value=10,
-        value=default_min_windows,
         step=1,
+        key="form_min_windows",
     )
+    st.text_area("Profile notes", key="form_notes")
+
+    if st.button("Save selected profile", use_container_width=True, disabled=selected_profile is None):
+        save_data, save_error = request_json(
+            f"{api_base}/api/v1/device-profiles",
+            method="POST",
+            payload={
+                "machine_id": selected_machine,
+                "device_id": selected_device,
+                "display_name": st.session_state.form_display_name.strip() or None,
+                "sample_rate_hz": int(sample_rate_hz),
+                "window_seconds": int(window_seconds),
+                "fallback_seconds": int(fallback_seconds),
+                "contamination": float(contamination),
+                "min_consecutive_windows": int(min_consecutive_windows),
+                "notes": st.session_state.form_notes.strip() or None,
+            },
+        )
+        if save_error:
+            st.error(f"Profile save failed: {save_error}")
+        else:
+            st.success(f"Saved profile {save_data.get('display_name') or selected_profile_label}")
+            st.rerun()
+
+    new_profile_display_name = st.text_input("Create profile (display name)", key="new_profile_display_name")
+    if st.button("Create profile", use_container_width=True):
+        create_name = new_profile_display_name.strip()
+        if not create_name:
+            st.error("Enter a display name to create a profile.")
+        else:
+            existing_names = {
+                str(item.get("display_name_raw") or "").strip().lower()
+                for item in normalized_profiles
+                if str(item.get("display_name_raw") or "").strip()
+            }
+            if create_name.lower() in existing_names:
+                st.error("A profile with this display name already exists.")
+            else:
+                new_machine_id, new_device_id = build_unique_profile_ids(create_name, normalized_profiles)
+                create_data, create_error = request_json(
+                    f"{api_base}/api/v1/device-profiles",
+                    method="POST",
+                    payload={
+                        "machine_id": new_machine_id,
+                        "device_id": new_device_id,
+                        "display_name": create_name,
+                        "sample_rate_hz": int(sample_rate_hz),
+                        "window_seconds": int(window_seconds),
+                        "fallback_seconds": int(fallback_seconds),
+                        "contamination": float(contamination),
+                        "min_consecutive_windows": int(min_consecutive_windows),
+                        "notes": st.session_state.form_notes.strip() or None,
+                    },
+                )
+                if create_error:
+                    st.error(f"Profile creation failed: {create_error}")
+                else:
+                    st.session_state.selected_profile_key = profile_key(
+                        str(create_data.get("machine_id") or ""),
+                        str(create_data.get("device_id") or ""),
+                    )
+                    st.session_state.new_profile_display_name = ""
+                    st.success(f"Created profile {create_data.get('display_name') or create_name}")
+                    st.rerun()
+
+    st.subheader("Calibration")
+    use_profile_defaults = st.toggle("Use saved profile settings", value=True)
     new_device_setup = st.toggle("New device setup", value=True)
 
     if st.button("Start calibration training", use_container_width=True):
-        start_data = None
-        start_error = None
-        if use_profile_defaults:
-            query = "true" if bool(new_device_setup) else "false"
-            start_data, start_error = request_json(
-                (
-                    f"{api_base}/api/v1/calibrate/start/profile/{selected_machine}/{selected_device}"
-                    f"?new_device_setup={query}&trigger_source=dashboard_ui"
-                ),
-                method="POST",
-            )
-
-        if (not use_profile_defaults) or start_error:
-            payload = {
-                "machine_id": selected_machine,
-                "device_id": selected_device,
-                "sample_rate_hz": int(sample_rate_hz),
-                "fallback_seconds": int(fallback_seconds),
-                "window_seconds": int(window_seconds),
-                "contamination": float(contamination),
-                "min_consecutive_windows": int(min_consecutive_windows),
-                "new_device_setup": bool(new_device_setup),
-                "trigger_source": "dashboard_ui",
-            }
-            if use_profile_defaults and start_error:
-                st.warning(f"Profile-based start failed. Using manual values instead: {start_error}")
-            start_data, start_error = request_json(
-                f"{api_base}/api/v1/calibrate/start",
-                method="POST",
-                payload=payload,
-            )
-
-        if start_error:
-            st.error(f"Calibration start failed: {start_error}")
+        if selected_profile is None:
+            st.error("Create and select a profile before starting calibration.")
+            start_data = None
+            start_error = "No profile selected"
         else:
-            st.session_state.active_job_id = start_data.get("job_id")
-            st.session_state.active_job_machine = selected_machine
-            st.session_state.active_job_device = selected_device
-            st.success(f"Calibration job started: {st.session_state.active_job_id}")
+            start_data = None
+            start_error = None
+
+            if use_profile_defaults:
+                query = "true" if bool(new_device_setup) else "false"
+                start_data, start_error = request_json(
+                    (
+                        f"{api_base}/api/v1/calibrate/start/profile/{selected_machine}/{selected_device}"
+                        f"?new_device_setup={query}&trigger_source=dashboard_ui"
+                    ),
+                    method="POST",
+                )
+
+            if (not use_profile_defaults) or start_error:
+                payload = {
+                    "machine_id": selected_machine,
+                    "device_id": selected_device,
+                    "sample_rate_hz": int(sample_rate_hz),
+                    "fallback_seconds": int(fallback_seconds),
+                    "window_seconds": int(window_seconds),
+                    "contamination": float(contamination),
+                    "min_consecutive_windows": int(min_consecutive_windows),
+                    "new_device_setup": bool(new_device_setup),
+                    "trigger_source": "dashboard_ui",
+                }
+                if use_profile_defaults and start_error:
+                    st.warning(f"Profile-based start failed. Using manual values instead: {start_error}")
+                start_data, start_error = request_json(
+                    f"{api_base}/api/v1/calibrate/start",
+                    method="POST",
+                    payload=payload,
+                )
+
+            if start_error:
+                st.error(f"Calibration start failed: {start_error}")
+            else:
+                st.session_state.active_job_id = start_data.get("job_id")
+                st.session_state.active_job_machine = selected_machine
+                st.session_state.active_job_device = selected_device
+                st.success(f"Calibration job started: {st.session_state.active_job_id}")
 
     st.subheader("Profile Lifecycle")
     confirm_profile_delete = st.toggle("Confirm profile delete", value=False)
-    if st.button("Delete selected profile", use_container_width=True):
+    if st.button("Delete selected profile", use_container_width=True, disabled=selected_profile is None):
         if not confirm_profile_delete:
             st.error("Enable profile delete confirmation before removing a profile.")
         else:
@@ -396,11 +620,17 @@ with st.sidebar:
             if delete_error:
                 st.error(f"Profile delete failed: {delete_error}")
             else:
-                st.success(f"Deleted profile {selected_machine}/{selected_device}")
+                st.session_state.selected_profile_key = None
+                st.session_state.profile_form_loaded_for = None
+                st.success(f"Deleted profile {selected_profile_label}")
                 st.rerun()
 
 
 def render_live_ui() -> None:
+    if st.session_state.selected_profile_key is None:
+        st.info("Select or create a profile to start live monitoring.")
+        return
+
     active_job_data = None
     if st.session_state.active_job_id:
         active_job_data, _ = request_json(f"{api_base}/api/v1/calibrate/status/{st.session_state.active_job_id}")
@@ -552,8 +782,7 @@ def render_live_ui() -> None:
                 "<div class='mc-title'>Machine Status</div>"
                 f"{status_badge(is_anomaly, status_label)}"
                 "<div style='margin-top:0.8rem; font-size:0.95rem;'>"
-                f"Machine: {selected_machine}<br/>"
-                f"Device: {selected_device}<br/>"
+                f"Profile: {selected_profile_label}<br/>"
                 f"Last update: {current.get('last_update', 'n/a')}<br/>"
                 f"Consecutive anomaly windows: {current.get('consecutive_windows', 0)}<br/>"
                 f"Checksum: {calibration.get('model_checksum', 'n/a')}"
@@ -594,6 +823,17 @@ def render_live_ui() -> None:
 
 @st.fragment(run_every=f"{refresh_seconds}s")
 def live_fragment() -> None:
+    st.session_state.live_tick += 1
+    tick_stamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    st.markdown(
+        (
+            "<div class='mc-live-pill'>"
+            "<span class='mc-live-dot'></span>"
+            f"Live updates every {refresh_seconds}s | tick #{st.session_state.live_tick} | {tick_stamp}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
     render_live_ui()
 
 
@@ -639,5 +879,4 @@ if use_thingspeak:
         )
         st.plotly_chart(hist_fig, use_container_width=True)
 
-footer_stamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-st.caption(f"Dashboard loaded at: {footer_stamp}")
+st.caption(f"Dashboard session started at: {st.session_state.session_started_at}")
