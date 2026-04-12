@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
+import random
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
 
@@ -21,16 +23,22 @@ from backend.ml_engine import (
     train_isolation_forest_distilled,
 )
 from backend.models import (
+    ApiDebugLogEntry,
     CalibrationJobStatus,
     CalibrationRequest,
     CalibrationResponse,
     CalibrationStartResponse,
+    DeviceProfileResponse,
+    DeviceProfileUpsertRequest,
     StreamIngestRequest,
 )
 from backend.storage import DataStore
 
 DB_PATH = os.getenv("MACHINOCARE_DB", "data/machinocare.db")
 BUFFER_SIZE = int(os.getenv("MACHINOCARE_BUFFER_SIZE", "12000"))
+DEBUG_SAMPLE_RATE = max(0.0, min(1.0, float(os.getenv("MACHINOCARE_DEBUG_SAMPLE_RATE", "0.10"))))
+DEBUG_RETENTION_DAYS = int(os.getenv("MACHINOCARE_DEBUG_RETENTION_DAYS", "30"))
+DEBUG_MAX_BODY_BYTES = int(os.getenv("MACHINOCARE_DEBUG_MAX_BODY_BYTES", "20000"))
 
 store = DataStore(db_path=DB_PATH, max_buffer_size=BUFFER_SIZE)
 
@@ -54,6 +62,7 @@ router = APIRouter()
 
 calibration_jobs: dict[str, dict[str, Any]] = {}
 calibration_jobs_lock = threading.Lock()
+last_debug_purge_monotonic = 0.0
 
 
 @app.get("/", include_in_schema=False)
@@ -63,6 +72,164 @@ def root() -> RedirectResponse:
 
 def utc_iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def maybe_decode_json(raw: bytes | None) -> Any | None:
+    if not raw:
+        return None
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    if not text.strip():
+        return None
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
+def truncate_payload(payload: Any) -> Any:
+    if payload is None:
+        return None
+
+    if isinstance(payload, str):
+        if len(payload) <= DEBUG_MAX_BODY_BYTES:
+            return payload
+        return payload[:DEBUG_MAX_BODY_BYTES] + "...<truncated>"
+
+    serialized = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+    if len(serialized) <= DEBUG_MAX_BODY_BYTES:
+        return payload
+
+    return {
+        "truncated": True,
+        "preview": serialized[:DEBUG_MAX_BODY_BYTES],
+    }
+
+
+def extract_machine_device(path: str, payload: Any, query_params: dict[str, str]) -> tuple[str | None, str | None]:
+    machine_id = None
+    device_id = None
+
+    if isinstance(payload, dict):
+        machine_id = payload.get("machine_id")
+        device_id = payload.get("device_id")
+
+    machine_id = machine_id or query_params.get("machine_id")
+    device_id = device_id or query_params.get("device_id")
+
+    parts = [part for part in path.split("/") if part]
+    if len(parts) >= 4 and parts[0] == "api" and parts[1] == "v1":
+        if parts[2] in {"status", "stream", "anomaly-log", "devices", "model"}:
+            machine_id = machine_id or parts[3]
+        if len(parts) >= 5 and parts[2] in {"status", "model"}:
+            device_id = device_id or parts[4]
+
+    return machine_id, device_id
+
+
+def persist_debug_log(entry: dict[str, Any]) -> None:
+    global last_debug_purge_monotonic
+
+    try:
+        store.save_api_debug_log(entry)
+        now_mono = time.monotonic()
+        if now_mono - last_debug_purge_monotonic >= 3600:
+            store.purge_api_debug_logs_older_than(DEBUG_RETENTION_DAYS)
+            last_debug_purge_monotonic = now_mono
+    except Exception:  # noqa: BLE001
+        # Logging must never interrupt the main API flow.
+        return
+
+
+@app.middleware("http")
+async def api_debug_log_middleware(request: Request, call_next: Any) -> Response:
+    if not request.url.path.startswith("/api/v1"):
+        return await call_next(request)
+
+    correlation_id = request.headers.get("x-correlation-id", str(uuid.uuid4()))
+
+    raw_request_body = await request.body()
+
+    async def _receive() -> dict[str, Any]:
+        return {
+            "type": "http.request",
+            "body": raw_request_body,
+            "more_body": False,
+        }
+
+    rebuilt_request = Request(request.scope, _receive)
+    parsed_request = maybe_decode_json(raw_request_body)
+
+    machine_id, device_id = extract_machine_device(
+        path=request.url.path,
+        payload=parsed_request,
+        query_params=dict(request.query_params),
+    )
+
+    started = time.perf_counter()
+    response: Response | None = None
+    caught_error = ""
+
+    try:
+        response = await call_next(rebuilt_request)
+    except Exception as exc:  # noqa: BLE001
+        caught_error = str(exc)
+        persist_debug_log(
+            {
+                "created_at": utc_iso_now(),
+                "endpoint": request.url.path,
+                "method": request.method,
+                "machine_id": machine_id,
+                "device_id": device_id,
+                "status_code": 500,
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "request_size": len(raw_request_body),
+                "response_size": 0,
+                "correlation_id": correlation_id,
+                "is_error": True,
+                "payload_sampled": True,
+                "request_payload": truncate_payload(parsed_request),
+                "response_payload": None,
+                "error_text": caught_error,
+            }
+        )
+        raise
+
+    response.headers["x-correlation-id"] = correlation_id
+
+    response_status = response.status_code
+    is_error = response_status >= 400
+    payload_sampled = is_error or (random.random() <= DEBUG_SAMPLE_RATE)
+
+    raw_response_body = getattr(response, "body", b"") or b""
+    parsed_response = maybe_decode_json(raw_response_body)
+
+    persist_debug_log(
+        {
+            "created_at": utc_iso_now(),
+            "endpoint": request.url.path,
+            "method": request.method,
+            "machine_id": machine_id,
+            "device_id": device_id,
+            "status_code": response_status,
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "request_size": len(raw_request_body),
+            "response_size": len(raw_response_body),
+            "correlation_id": correlation_id,
+            "is_error": is_error,
+            "payload_sampled": payload_sampled,
+            "request_payload": truncate_payload(parsed_request) if payload_sampled else None,
+            "response_payload": truncate_payload(parsed_response) if payload_sampled else None,
+            "error_text": caught_error or None,
+        }
+    )
+
+    return response
 
 
 def round_list(values: list[float], ndigits: int = 6) -> list[float]:
@@ -563,6 +730,34 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
     )
 
 
+@router.post("/calibrate/start/profile/{machine_id}/{device_id}", response_model=CalibrationStartResponse)
+def calibrate_start_from_profile(
+    machine_id: str,
+    device_id: str,
+    new_device_setup: bool = Query(default=True),
+    trigger_source: str = Query(default="dashboard_profile"),
+) -> CalibrationStartResponse:
+    profile = store.get_device_profile(machine_id, device_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No device profile found for machine '{machine_id}', device '{device_id}'.",
+        )
+
+    payload = CalibrationRequest(
+        machine_id=machine_id,
+        device_id=device_id,
+        sample_rate_hz=int(profile.get("sample_rate_hz") or 25),
+        window_seconds=int(profile.get("window_seconds") or 1),
+        fallback_seconds=int(profile.get("fallback_seconds") or 300),
+        contamination=float(profile.get("contamination") or 0.05),
+        min_consecutive_windows=int(profile.get("min_consecutive_windows") or 3),
+        new_device_setup=new_device_setup,
+        trigger_source=trigger_source,
+    )
+    return calibrate_start(payload)
+
+
 @router.get("/calibrate/status/{job_id}", response_model=CalibrationJobStatus)
 def calibrate_status(job_id: str) -> CalibrationJobStatus:
     job = _get_job(job_id)
@@ -709,6 +904,60 @@ def devices(machine_id: str) -> dict[str, Any]:
     return {
         "machine_id": machine_id,
         "devices": store.list_devices(machine_id),
+    }
+
+
+@router.post("/device-profiles", response_model=DeviceProfileResponse)
+def upsert_device_profile(payload: DeviceProfileUpsertRequest) -> DeviceProfileResponse:
+    profile = store.upsert_device_profile(payload.model_dump())
+    if not profile:
+        raise HTTPException(status_code=500, detail="Failed to save device profile.")
+    return DeviceProfileResponse(**profile)
+
+
+@router.get("/device-profiles/{machine_id}/{device_id}", response_model=DeviceProfileResponse)
+def get_device_profile(machine_id: str, device_id: str) -> DeviceProfileResponse:
+    profile = store.get_device_profile(machine_id, device_id)
+    if not profile:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Device profile not found for machine '{machine_id}', device '{device_id}'.",
+        )
+    return DeviceProfileResponse(**profile)
+
+
+@router.get("/device-profiles")
+def list_device_profiles(
+    machine_id: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    profiles = store.list_device_profiles(machine_id=machine_id, limit=limit)
+    return {
+        "machine_id": machine_id,
+        "count": len(profiles),
+        "profiles": [DeviceProfileResponse(**profile).model_dump() for profile in profiles],
+    }
+
+
+@router.get("/debug/logs")
+def debug_logs(
+    machine_id: str | None = Query(default=None),
+    device_id: str | None = Query(default=None),
+    endpoint: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+) -> dict[str, Any]:
+    logs = store.list_api_debug_logs(
+        machine_id=machine_id,
+        device_id=device_id,
+        endpoint=endpoint,
+        limit=limit,
+    )
+    return {
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "endpoint": endpoint,
+        "count": len(logs),
+        "logs": [ApiDebugLogEntry(**item).model_dump() for item in logs],
     }
 
 

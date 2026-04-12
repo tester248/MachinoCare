@@ -90,6 +90,62 @@ class DataStore:
             self.conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_anom_machine_time ON anomaly_events(machine_id, timestamp)"
             )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS device_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    machine_id TEXT NOT NULL,
+                    device_id TEXT NOT NULL,
+                    display_name TEXT,
+                    sample_rate_hz INTEGER,
+                    window_seconds INTEGER,
+                    fallback_seconds INTEGER,
+                    contamination REAL,
+                    min_consecutive_windows INTEGER,
+                    notes TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(machine_id, device_id)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS api_debug_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    method TEXT NOT NULL,
+                    machine_id TEXT,
+                    device_id TEXT,
+                    status_code INTEGER,
+                    latency_ms INTEGER,
+                    request_size INTEGER,
+                    response_size INTEGER,
+                    correlation_id TEXT,
+                    is_error INTEGER NOT NULL DEFAULT 0,
+                    payload_sampled INTEGER NOT NULL DEFAULT 0,
+                    request_payload TEXT,
+                    response_payload TEXT,
+                    error_text TEXT
+                )
+                """
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_profiles_machine_device ON device_profiles(machine_id, device_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_profiles_machine ON device_profiles(machine_id)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_debug_time ON api_debug_logs(created_at)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_debug_machine_device_time ON api_debug_logs(machine_id, device_id, created_at)"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_debug_endpoint_time ON api_debug_logs(endpoint, created_at)"
+            )
 
     def add_samples(
         self,
@@ -366,6 +422,255 @@ class DataStore:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def upsert_device_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        machine_id = str(payload["machine_id"])
+        device_id = str(payload["device_id"])
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._lock:
+            row = self.conn.execute(
+                """
+                SELECT created_at
+                FROM device_profiles
+                WHERE machine_id = ? AND device_id = ?
+                """,
+                (machine_id, device_id),
+            ).fetchone()
+            created_at = row["created_at"] if row else now
+
+            with self.conn:
+                self.conn.execute(
+                    """
+                    INSERT INTO device_profiles (
+                        machine_id,
+                        device_id,
+                        display_name,
+                        sample_rate_hz,
+                        window_seconds,
+                        fallback_seconds,
+                        contamination,
+                        min_consecutive_windows,
+                        notes,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(machine_id, device_id)
+                    DO UPDATE SET
+                        display_name = excluded.display_name,
+                        sample_rate_hz = excluded.sample_rate_hz,
+                        window_seconds = excluded.window_seconds,
+                        fallback_seconds = excluded.fallback_seconds,
+                        contamination = excluded.contamination,
+                        min_consecutive_windows = excluded.min_consecutive_windows,
+                        notes = excluded.notes,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        machine_id,
+                        device_id,
+                        payload.get("display_name"),
+                        payload.get("sample_rate_hz"),
+                        payload.get("window_seconds"),
+                        payload.get("fallback_seconds"),
+                        payload.get("contamination"),
+                        payload.get("min_consecutive_windows"),
+                        payload.get("notes"),
+                        created_at,
+                        now,
+                    ),
+                )
+
+        profile = self.get_device_profile(machine_id, device_id)
+        return profile or {}
+
+    def get_device_profile(self, machine_id: str, device_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT
+                machine_id,
+                device_id,
+                display_name,
+                sample_rate_hz,
+                window_seconds,
+                fallback_seconds,
+                contamination,
+                min_consecutive_windows,
+                notes,
+                created_at,
+                updated_at
+            FROM device_profiles
+            WHERE machine_id = ? AND device_id = ?
+            """,
+            (machine_id, device_id),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_device_profiles(
+        self,
+        machine_id: str | None = None,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        where = ""
+        if machine_id is not None:
+            where = "WHERE machine_id = ?"
+            params.append(machine_id)
+        params.append(limit)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                machine_id,
+                device_id,
+                display_name,
+                sample_rate_hz,
+                window_seconds,
+                fallback_seconds,
+                contamination,
+                min_consecutive_windows,
+                notes,
+                created_at,
+                updated_at
+            FROM device_profiles
+            {where}
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _encode_json_payload(payload: Any) -> str | None:
+        if payload is None:
+            return None
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _decode_json_payload(payload: str | None) -> Any:
+        if payload is None:
+            return None
+        try:
+            return json.loads(payload)
+        except Exception:  # noqa: BLE001
+            return payload
+
+    def save_api_debug_log(self, entry: dict[str, Any]) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO api_debug_logs (
+                    created_at,
+                    endpoint,
+                    method,
+                    machine_id,
+                    device_id,
+                    status_code,
+                    latency_ms,
+                    request_size,
+                    response_size,
+                    correlation_id,
+                    is_error,
+                    payload_sampled,
+                    request_payload,
+                    response_payload,
+                    error_text
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    entry.get("created_at") or datetime.now(timezone.utc).isoformat(),
+                    entry.get("endpoint"),
+                    entry.get("method"),
+                    entry.get("machine_id"),
+                    entry.get("device_id"),
+                    entry.get("status_code"),
+                    entry.get("latency_ms"),
+                    entry.get("request_size"),
+                    entry.get("response_size"),
+                    entry.get("correlation_id"),
+                    1 if entry.get("is_error") else 0,
+                    1 if entry.get("payload_sampled") else 0,
+                    self._encode_json_payload(entry.get("request_payload")),
+                    self._encode_json_payload(entry.get("response_payload")),
+                    entry.get("error_text"),
+                ),
+            )
+
+    def list_api_debug_logs(
+        self,
+        *,
+        machine_id: str | None = None,
+        device_id: str | None = None,
+        endpoint: str | None = None,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        params: list[Any] = []
+        clauses: list[str] = []
+        if machine_id is not None:
+            clauses.append("machine_id = ?")
+            params.append(machine_id)
+        if device_id is not None:
+            clauses.append("device_id = ?")
+            params.append(device_id)
+        if endpoint is not None:
+            clauses.append("endpoint = ?")
+            params.append(endpoint)
+
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT
+                id,
+                created_at,
+                endpoint,
+                method,
+                machine_id,
+                device_id,
+                status_code,
+                latency_ms,
+                request_size,
+                response_size,
+                correlation_id,
+                is_error,
+                payload_sampled,
+                request_payload,
+                response_payload,
+                error_text
+            FROM api_debug_logs
+            {where}
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+        decoded: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["is_error"] = bool(item.get("is_error"))
+            item["payload_sampled"] = bool(item.get("payload_sampled"))
+            item["request_payload"] = self._decode_json_payload(item.get("request_payload"))
+            item["response_payload"] = self._decode_json_payload(item.get("response_payload"))
+            decoded.append(item)
+
+        return decoded
+
+    def purge_api_debug_logs_older_than(self, days: int) -> int:
+        if days <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        with self.conn:
+            cursor = self.conn.execute(
+                "DELETE FROM api_debug_logs WHERE created_at < ?",
+                (cutoff,),
+            )
+        return int(cursor.rowcount or 0)
+
     def list_machine_ids(self) -> list[str]:
         with self._lock:
             known = set(self.buffers.keys())
@@ -399,6 +704,12 @@ class DataStore:
 
         rows = self.conn.execute(
             "SELECT DISTINCT device_id FROM calibrations WHERE machine_id = ?",
+            (machine_id,),
+        ).fetchall()
+        devices.update(row[0] for row in rows)
+
+        rows = self.conn.execute(
+            "SELECT DISTINCT device_id FROM device_profiles WHERE machine_id = ?",
             (machine_id,),
         ).fetchall()
         devices.update(row[0] for row in rows)

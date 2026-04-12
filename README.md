@@ -103,6 +103,7 @@ python run_all.py
 ### Calibration and model
 - `POST /api/v1/calibrate`
 - `POST /api/v1/calibrate/start`
+- `POST /api/v1/calibrate/start/profile/{machine_id}/{device_id}`
 - `GET /api/v1/calibrate/status/{job_id}`
 - `GET /api/v1/model/{machine_id}`
 - `GET /api/v1/model/{machine_id}/{device_id}`
@@ -110,6 +111,14 @@ python run_all.py
 ### Discovery
 - `GET /api/v1/machines`
 - `GET /api/v1/devices/{machine_id}`
+
+### Debug and profiles
+- `POST /api/v1/device-profiles`
+- `GET /api/v1/device-profiles`
+- `GET /api/v1/device-profiles/{machine_id}/{device_id}`
+- `GET /api/v1/debug/logs`
+
+These endpoints are additive and do not require ESP32 firmware changes.
 
 ## Example Requests
 

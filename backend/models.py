@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -126,3 +126,48 @@ class CalibrationJobStatus(BaseModel):
     message: str | None = None
     error: str | None = None
     result: dict | None = None
+
+
+class DeviceProfileUpsertRequest(BaseModel):
+    machine_id: str = Field(min_length=1, max_length=64)
+    device_id: str = Field(min_length=1, max_length=64)
+    display_name: str | None = Field(default=None, max_length=128)
+    sample_rate_hz: int | None = Field(default=None, ge=1, le=500)
+    window_seconds: int | None = Field(default=None, ge=1, le=10)
+    fallback_seconds: int | None = Field(default=None, ge=10, le=86400)
+    contamination: float | None = Field(default=None, ge=0.01, le=0.40)
+    min_consecutive_windows: int | None = Field(default=None, ge=1, le=10)
+    notes: str | None = Field(default=None, max_length=1000)
+
+
+class DeviceProfileResponse(BaseModel):
+    machine_id: str
+    device_id: str
+    display_name: str | None = None
+    sample_rate_hz: int | None = None
+    window_seconds: int | None = None
+    fallback_seconds: int | None = None
+    contamination: float | None = None
+    min_consecutive_windows: int | None = None
+    notes: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class ApiDebugLogEntry(BaseModel):
+    id: int
+    created_at: str
+    endpoint: str
+    method: str
+    machine_id: str | None = None
+    device_id: str | None = None
+    status_code: int | None = None
+    latency_ms: int | None = None
+    request_size: int | None = None
+    response_size: int | None = None
+    correlation_id: str | None = None
+    is_error: bool = False
+    payload_sampled: bool = False
+    request_payload: Any | None = None
+    response_payload: Any | None = None
+    error_text: str | None = None
