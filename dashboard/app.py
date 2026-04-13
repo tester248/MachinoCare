@@ -314,6 +314,23 @@ def normalize_recent_samples(samples: list[dict]) -> pd.DataFrame:
     return frame
 
 
+def safe_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+
+    frame = frame.copy()
+    for col in frame.columns:
+        if frame[col].dtype == object:
+            values = frame[col].dropna()
+            if values.empty:
+                continue
+            if values.map(lambda v: isinstance(v, (int, float, bool))).all():
+                frame[col] = pd.to_numeric(frame[col], errors="coerce")
+            else:
+                frame[col] = frame[col].astype(str)
+    return frame
+
+
 def profile_key(machine_id: str, device_id: str) -> str:
     return f"{machine_id}::{device_id}"
 
@@ -897,7 +914,7 @@ def render_live_ui() -> None:
                 st.subheader("Latest Sample - All Values")
                 latest_t = latest.T
                 latest_t.columns = ["value"]
-                st.dataframe(latest_t, width="stretch", height=420)
+                st.dataframe(safe_dataframe(latest_t), width="stretch", height=420)
 
     with right:
         health_score = None
@@ -1027,7 +1044,7 @@ def render_live_ui() -> None:
                 }
                 for item in logs
             ]
-            st.dataframe(pd.DataFrame(summary_rows), width="stretch", height=280)
+            st.dataframe(safe_dataframe(pd.DataFrame(summary_rows)), width="stretch", height=280)
             with st.expander("Latest API log payload details", expanded=False):
                 st.json(logs[:20])
 
