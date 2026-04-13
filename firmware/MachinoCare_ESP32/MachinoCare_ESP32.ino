@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <BlynkSimpleEsp32.h>
 #include <ThingSpeak.h>
+#include <WebSocketsClient.h>
 #include "time.h"
 
 // WiFi and cloud credentials
@@ -39,6 +40,7 @@ String activeBindingDeviceId = "";
 const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 const int daylightOffset_sec = 0;
+
 
 // Hardware pins
 const int SW420_PIN = 34;
@@ -63,6 +65,7 @@ MPU6050 mpu;
 BlynkTimer timer;
 Preferences prefs;
 WiFiClientSecure apiClient;
+WebSocketsClient streamWebSocket;
 
 float accMag = 0;
 float gyroMag = 0;
@@ -81,14 +84,25 @@ bool sw420FaultAnnounced = false;
 
 volatile bool sw420InterruptPending = false;
 unsigned long sw420LastConfirmedTriggerMs = 0;
-unsigned long sw420WindowStartMs = 0;
-int sw420TriggerCountInWindow = 0;
 unsigned long sw420DebugCooldownUntilMs = 0;
 
 const unsigned long SW420_DEBOUNCE_MS = 150;
-const unsigned long SW420_WINDOW_MS = 5000;
-const int SW420_MAX_TRIGGERS = 3;
 const unsigned long SW420_DEBUG_COOLDOWN_MS = 4000;
+
+// NEW SW420 frame-threshold logic state
+unsigned long sw420HighAccumulatedMs = 0;
+unsigned long sw420FrameStartMs = 0;
+unsigned long sw420LastSampleMs = 0;
+bool sw420FrameFail = false;
+
+// Slider-configurable values (Blynk)
+int sw420ThresholdSec = 20;   // V22
+int sw420FrameSec = 40;       // V23
+
+// SW420 fail buzzer behavior
+unsigned long sw420FailBuzzerStartMs = 0;
+bool sw420FailBuzzerActive = false;
+const unsigned long SW420_FAIL_BUZZ_MS = 5000;
 
 // Indicator control state
 bool motorOn = true;
@@ -136,6 +150,13 @@ unsigned long streamSuccessCount = 0;
 unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
+String wsHost = "";
+String wsPath = "";
+uint16_t wsPort = 0;
+bool wsUseTls = true;
+bool wsConfigured = false;
+bool wsConnected = false;
+unsigned long lastWsConnectAttemptMs = 0;
 
 unsigned long lastWiFiReconnectAttemptMs = 0;
 unsigned long lastBlynkConnectAttemptMs = 0;
@@ -144,6 +165,11 @@ unsigned long lastBindingRefreshMs = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long BLYNK_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long BINDING_REFRESH_INTERVAL_MS = 30000;
+const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long WS_ACK_TIMEOUT_MS = 6000;
+
+const int STREAM_BATCH_SIZE = 5;
+const int STREAM_QUEUE_CAPACITY = 30;
 
 // Feature window
 const int WINDOW_SIZE = 10;
@@ -158,7 +184,30 @@ int windowCount = 0;
 const int STREAM_HTTP_TIMEOUT_MS = 3500;
 const int MODEL_HTTP_TIMEOUT_MS = 5000;
 
+struct StreamQueuedSample {
+  char timestamp[40];
+  float accMag;
+  float gyroMag;
+  int gx;
+  int gy;
+  int gz;
+  int sw420;
+  int sequence;
+};
+
+StreamQueuedSample streamQueue[STREAM_QUEUE_CAPACITY];
+int streamQueueHead = 0;
+int streamQueueCount = 0;
+int streamNextSequence = 1;
+bool streamInFlight = false;
+int streamInFlightCount = 0;
+unsigned long streamInFlightSentAtMs = 0;
+unsigned long streamDroppedCount = 0;
+
 // -------------------- Helpers --------------------
+
+void updateAlertOutputs();
+void onStreamWsEvent(WStype_t type, uint8_t* payload, size_t length);
 
 void applyIndicators() {
   updateAlertOutputs();
@@ -197,10 +246,19 @@ void updateAlertOutputs() {
   // SW420 safety highest priority
   if (sw420FaultLatched || sw420Muted) {
     ledState = false;
-    buzzerState = false;
-    if (!debugMode) {
-      motorOn = false;
-      fanOn = false;
+
+    // Buzzer ON for first 5s after SW420 fail
+    if (sw420FailBuzzerActive && (now - sw420FailBuzzerStartMs < SW420_FAIL_BUZZ_MS)) {
+      buzzerState = true;
+    } else {
+      sw420FailBuzzerActive = false;
+      buzzerState = false;
+
+      // After 5s, shutdown only in production mode
+      if (!debugMode && sw420FaultLatched) {
+        motorOn = false;
+        fanOn = false;
+      }
     }
   }
 
@@ -253,6 +311,93 @@ void IRAM_ATTR emergencyKillSwitch() {
   sw420InterruptPending = true;
 }
 
+void evaluateSw420FrameLogic() {
+  unsigned long now = millis();
+
+  if (sw420FrameStartMs == 0) {
+    sw420FrameStartMs = now;
+    sw420LastSampleMs = now;
+    sw420HighAccumulatedMs = 0;
+    sw420FrameFail = false;
+    return;
+  }
+
+  unsigned long dt = now - sw420LastSampleMs;
+  sw420LastSampleMs = now;
+
+  // Keep threshold valid: threshold < frame
+  if (sw420ThresholdSec >= sw420FrameSec) {
+    sw420ThresholdSec = sw420FrameSec - 1;
+    if (sw420ThresholdSec < 1) sw420ThresholdSec = 1;
+    if (Blynk.connected()) Blynk.virtualWrite(V22, sw420ThresholdSec);
+  }
+
+  unsigned long frameMs = (unsigned long)sw420FrameSec * 1000UL;
+  unsigned long thresholdMs = (unsigned long)sw420ThresholdSec * 1000UL;
+
+  // Accumulate HIGH duration, capped to frame
+  if (digitalRead(SW420_PIN) == HIGH) {
+    if (sw420HighAccumulatedMs + dt >= frameMs) sw420HighAccumulatedMs = frameMs;
+    else sw420HighAccumulatedMs += dt;
+  }
+
+  // Drift-safe frame completion
+  while (now - sw420FrameStartMs >= frameMs) {
+    if (sw420HighAccumulatedMs > frameMs) sw420HighAccumulatedMs = frameMs;
+
+    sw420FrameFail = (sw420HighAccumulatedMs >= thresholdMs);
+
+    if (sw420FrameFail) {
+      // start 5s buzzer window
+      sw420FailBuzzerActive = true;
+      sw420FailBuzzerStartMs = millis();
+
+      if (debugMode) {
+        sw420DebugCooldownActive = true;
+        sw420DebugCooldownUntilMs = now + SW420_DEBUG_COOLDOWN_MS;
+        sw420FaultLatched = false;
+        emergencyTriggered = false;
+        sw420FaultAnnounced = false;
+        Serial.println("SW420 FRAME FAIL (debug mute active)");
+      } else {
+        sw420FaultLatched = true;
+        sw420FaultAnnounced = false;
+        emergencyTriggered = true;
+      }
+
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V26,
+          "FAIL | HIGH=" + String(sw420HighAccumulatedMs / 1000.0, 1) +
+          "s / FRAME=" + String(sw420FrameSec) +
+          "s | TH=" + String(sw420ThresholdSec) + "s");
+      }
+    } else {
+      if (Blynk.connected()) {
+        Blynk.virtualWrite(V26,
+          "PASS | HIGH=" + String(sw420HighAccumulatedMs / 1000.0, 1) +
+          "s / FRAME=" + String(sw420FrameSec) +
+          "s | TH=" + String(sw420ThresholdSec) + "s");
+      }
+    }
+
+    Serial.print("SW420_FRAME,high_s=");
+    Serial.print(sw420HighAccumulatedMs / 1000.0, 2);
+    Serial.print(",frame_s=");
+    Serial.print(sw420FrameSec);
+    Serial.print(",th_s=");
+    Serial.print(sw420ThresholdSec);
+    Serial.print(",result=");
+    Serial.println(sw420FrameFail ? "FAIL" : "PASS");
+
+    // Advance exactly one frame
+    sw420FrameStartMs += frameMs;
+
+    // Reset accumulators for next frame
+    sw420HighAccumulatedMs = 0;
+    sw420FrameFail = false;
+  }
+}
+
 void processSw420Trigger() {
   bool pending = false;
 
@@ -261,43 +406,14 @@ void processSw420Trigger() {
   sw420InterruptPending = false;
   interrupts();
 
-  if (!pending) return;
-  if (digitalRead(SW420_PIN) != HIGH) return;
-
-  unsigned long now = millis();
-  if (now - sw420LastConfirmedTriggerMs < SW420_DEBOUNCE_MS) return;
-  sw420LastConfirmedTriggerMs = now;
-
-  if (sw420WindowStartMs == 0 || now - sw420WindowStartMs > SW420_WINDOW_MS) {
-    sw420WindowStartMs = now;
-    sw420TriggerCountInWindow = 0;
-    sw420FaultAnnounced = false;
-  }
-
-  sw420TriggerCountInWindow++;
-
-  if (sw420TriggerCountInWindow >= SW420_MAX_TRIGGERS) {
-    if (debugMode) {
-      sw420DebugCooldownActive = true;
-      sw420DebugCooldownUntilMs = now + SW420_DEBUG_COOLDOWN_MS;
-      sw420FaultLatched = false;
-      emergencyTriggered = false;
-      sw420FaultAnnounced = false;
-      Serial.println("DEBUG WARNING: SW-420 trigger window exceeded (temporary mute active)");
-    } else {
-      sw420FaultLatched = true;
-      sw420FaultAnnounced = false;
-      emergencyTriggered = true;
+  if (pending) {
+    unsigned long now = millis();
+    if (now - sw420LastConfirmedTriggerMs >= SW420_DEBOUNCE_MS) {
+      sw420LastConfirmedTriggerMs = now;
     }
-  } else {
-    Serial.print("DEBUG WARNING: SW-420 trigger detected (debounced, count=");
-    Serial.print(sw420TriggerCountInWindow);
-    Serial.print(", window_ms=");
-    Serial.print(SW420_WINDOW_MS);
-    Serial.println(")");
   }
 
-  emergencyTriggered = sw420FaultLatched;
+  evaluateSw420FrameLogic();
 }
 
 String getTimeString() {
@@ -475,13 +591,8 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
 
     http.end();
 
-    if (code >= 200 && code < 300) {
-      return true;
-    }
-
-    if (code != -11 && code != -1) {
-      return false;
-    }
+    if (code >= 200 && code < 300) return true;
+    if (code != -11 && code != -1) return false;
 
     ensureWiFiConnection();
     delay(40);
@@ -530,19 +641,277 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
 
     http.end();
 
-    if (code >= 200 && code < 300) {
-      return true;
-    }
-
-    if (code != -11 && code != -1) {
-      return false;
-    }
+    if (code >= 200 && code < 300) return true;
+    if (code != -11 && code != -1) return false;
 
     ensureWiFiConnection();
     delay(40);
   }
 
   return false;
+}
+
+bool parseBackendBaseForWs(const String& baseUrl, String& hostOut, uint16_t& portOut, String& pathOut, bool& useTlsOut) {
+  String url = baseUrl;
+  url.trim();
+  if (url.length() == 0) return false;
+
+  bool isTls = true;
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd >= 0) {
+    String scheme = url.substring(0, schemeEnd);
+    scheme.toLowerCase();
+    if (scheme == "http") isTls = false;
+    else if (scheme == "https") isTls = true;
+    else return false;
+    url = url.substring(schemeEnd + 3);
+  }
+
+  int slashPos = url.indexOf('/');
+  String hostPort = (slashPos >= 0) ? url.substring(0, slashPos) : url;
+  String basePath = (slashPos >= 0) ? url.substring(slashPos) : "";
+  if (hostPort.length() == 0) return false;
+
+  int colonPos = hostPort.indexOf(':');
+  String host = hostPort;
+  uint16_t port = isTls ? 443 : 80;
+  if (colonPos >= 0) {
+    host = hostPort.substring(0, colonPos);
+    String portStr = hostPort.substring(colonPos + 1);
+    int parsed = portStr.toInt();
+    if (parsed <= 0 || parsed > 65535) return false;
+    port = (uint16_t)parsed;
+  }
+  if (host.length() == 0) return false;
+
+  String wsPathLocal = basePath;
+  if (!wsPathLocal.startsWith("/")) wsPathLocal = "/" + wsPathLocal;
+  if (wsPathLocal.endsWith("/")) wsPathLocal.remove(wsPathLocal.length() - 1);
+  if (wsPathLocal == "/") wsPathLocal = "";
+  wsPathLocal += "/api/v1/ws/stream";
+
+  hostOut = host;
+  portOut = port;
+  pathOut = wsPathLocal;
+  useTlsOut = isTls;
+  return true;
+}
+
+void configureStreamWebSocket() {
+  wsConfigured = parseBackendBaseForWs(BACKEND_BASE_URL, wsHost, wsPort, wsPath, wsUseTls);
+  if (!wsConfigured) {
+    Serial.println("WS_CONFIG_FAIL: invalid BACKEND_BASE_URL");
+    return;
+  }
+
+  streamWebSocket.onEvent(onStreamWsEvent);
+  if (wsUseTls) {
+    streamWebSocket.beginSSL(wsHost.c_str(), wsPort, wsPath.c_str());
+  } else {
+    streamWebSocket.begin(wsHost.c_str(), wsPort, wsPath.c_str());
+  }
+  streamWebSocket.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
+  streamWebSocket.enableHeartbeat(15000, 3000, 2);
+
+  Serial.print("WS_CONFIG_OK,host=");
+  Serial.print(wsHost);
+  Serial.print(",port=");
+  Serial.print(wsPort);
+  Serial.print(",path=");
+  Serial.println(wsPath);
+}
+
+int streamQueueIndex(int logicalIdx) {
+  return (streamQueueHead + logicalIdx) % STREAM_QUEUE_CAPACITY;
+}
+
+void popStreamQueue(int count) {
+  if (count <= 0 || streamQueueCount <= 0) return;
+  if (count > streamQueueCount) count = streamQueueCount;
+  streamQueueHead = (streamQueueHead + count) % STREAM_QUEUE_CAPACITY;
+  streamQueueCount -= count;
+}
+
+void enqueueCurrentSampleForStream() {
+  StreamQueuedSample item;
+  memset(&item, 0, sizeof(item));
+
+  String apiTs;
+  if (getIsoTimestampForApi(apiTs)) {
+    apiTs.toCharArray(item.timestamp, sizeof(item.timestamp));
+  } else {
+    item.timestamp[0] = '\0';
+  }
+
+  item.accMag = accMag;
+  item.gyroMag = gyroMag;
+  item.gx = gx;
+  item.gy = gy;
+  item.gz = gz;
+  item.sw420 = digitalRead(SW420_PIN);
+  item.sequence = streamNextSequence++;
+
+  if (streamQueueCount >= STREAM_QUEUE_CAPACITY) {
+    popStreamQueue(1);
+    streamDroppedCount++;
+  }
+
+  int insertAt = streamQueueIndex(streamQueueCount);
+  streamQueue[insertAt] = item;
+  streamQueueCount++;
+}
+
+String buildBatchPayload(int maxSamples, int& outBatchCount) {
+  outBatchCount = streamQueueCount;
+  if (outBatchCount > maxSamples) outBatchCount = maxSamples;
+  if (outBatchCount < 0) outBatchCount = 0;
+
+  StaticJsonDocument<4096> req;
+  req["esp_model_version"] = modelVersion;
+  req["esp_model_checksum"] = modelChecksum;
+  JsonArray samples = req.createNestedArray("samples");
+
+  for (int i = 0; i < outBatchCount; i++) {
+    const StreamQueuedSample& item = streamQueue[streamQueueIndex(i)];
+    JsonObject s = samples.createNestedObject();
+    if (item.timestamp[0] != '\0') {
+      s["timestamp"] = item.timestamp;
+    }
+    s["accMag"] = item.accMag;
+    s["gyroMag"] = item.gyroMag;
+    s["gx"] = item.gx;
+    s["gy"] = item.gy;
+    s["gz"] = item.gz;
+    s["sw420"] = item.sw420;
+    s["sequence"] = item.sequence;
+  }
+
+  String payload;
+  serializeJson(req, payload);
+  return payload;
+}
+
+void handleStreamAckPayload(const String& message) {
+  DynamicJsonDocument doc(4096);
+  if (deserializeJson(doc, message) != DeserializationError::Ok) {
+    return;
+  }
+
+  String type = String((const char*)(doc["type"] | ""));
+  if (type == "ack") {
+    int received = doc["received_samples"] | streamInFlightCount;
+    if (received <= 0) received = streamInFlightCount;
+    if (streamInFlight) {
+      popStreamQueue(received);
+      streamInFlight = false;
+      streamInFlightCount = 0;
+      streamSuccessCount++;
+      lastStreamHttpCode = 101;
+      lastStreamResult = "OK:WS_ACK";
+    }
+    if (doc.containsKey("is_anomaly") && doc["is_anomaly"].as<bool>()) {
+      isMachineFailing = true;
+    }
+    return;
+  }
+
+  if (type == "error") {
+    int statusCode = doc["status_code"] | -104;
+    String detail = String((const char*)(doc["detail"] | "ws_error"));
+    streamInFlight = false;
+    streamInFlightCount = 0;
+    streamFailCount++;
+    lastStreamHttpCode = statusCode;
+    lastStreamResult = "FAIL:WS_" + String(statusCode);
+    Serial.print("WS_STREAM_ERROR,");
+    Serial.println(detail);
+    return;
+  }
+
+  if (type == "connected") {
+    lastStreamHttpCode = 101;
+    lastStreamResult = "WS_READY";
+  }
+}
+
+void onStreamWsEvent(WStype_t type, uint8_t* payload, size_t length) {
+  switch (type) {
+    case WStype_CONNECTED:
+      wsConnected = true;
+      lastStreamHttpCode = 101;
+      lastStreamResult = "WS_CONNECTED";
+      Serial.println("WS_CONNECTED");
+      break;
+    case WStype_DISCONNECTED:
+      wsConnected = false;
+      streamInFlight = false;
+      streamInFlightCount = 0;
+      lastStreamResult = "WS_DISCONNECTED";
+      Serial.println("WS_DISCONNECTED");
+      break;
+    case WStype_TEXT: {
+      String msg;
+      msg.reserve(length + 1);
+      for (size_t i = 0; i < length; i++) msg += (char)payload[i];
+      handleStreamAckPayload(msg);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void ensureStreamWebSocketConnection() {
+  if (!backendEnabled || !wsConfigured) return;
+  if (wsConnected) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastWsConnectAttemptMs < WS_RECONNECT_INTERVAL_MS) return;
+  lastWsConnectAttemptMs = now;
+
+  streamWebSocket.disconnect();
+  if (wsUseTls) {
+    streamWebSocket.beginSSL(wsHost.c_str(), wsPort, wsPath.c_str());
+  } else {
+    streamWebSocket.begin(wsHost.c_str(), wsPort, wsPath.c_str());
+  }
+  streamWebSocket.onEvent(onStreamWsEvent);
+  streamWebSocket.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
+}
+
+bool sendBatchOverHttpFallback(int batchCount) {
+  if (batchCount <= 0) return false;
+
+  int payloadCount = 0;
+  String payload = buildBatchPayload(batchCount, payloadCount);
+  if (payloadCount <= 0) return false;
+
+  String response;
+  int httpCode = 0;
+  String url = String(BACKEND_BASE_URL) + "/api/v1/stream";
+  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
+    streamFailCount++;
+    lastStreamHttpCode = httpCode;
+    if (httpCode == -1) lastStreamResult = "FAIL: WIFI_DOWN";
+    else if (httpCode == -2) lastStreamResult = "FAIL: HTTP_BEGIN";
+    else if (httpCode == -11) lastStreamResult = "FAIL: HTTP_TIMEOUT";
+    else lastStreamResult = "FAIL: HTTP_" + String(httpCode);
+    return false;
+  }
+
+  popStreamQueue(payloadCount);
+  streamSuccessCount++;
+  lastStreamHttpCode = httpCode;
+  lastStreamResult = "OK:HTTP_BATCH";
+
+  DynamicJsonDocument doc(2048);
+  if (deserializeJson(doc, response) == DeserializationError::Ok) {
+    if (doc.containsKey("is_anomaly") && doc["is_anomaly"].as<bool>()) {
+      isMachineFailing = true;
+    }
+  }
+  return true;
 }
 
 bool refreshActiveBinding(bool force = false) {
@@ -705,7 +1074,7 @@ bool startCalibrationJobOnBackend(bool newDeviceSetup, const char* triggerSource
   StaticJsonDocument<768> req;
   req["machine_id"] = activeBindingMachineId;
   req["device_id"] = activeBindingDeviceId;
-  req["sample_rate_hz"] = 10;
+  req["sample_rate_hz"] = 1;
   req["window_seconds"] = 1;
   req["fallback_seconds"] = 300;
   req["contamination"] = 0.05;
@@ -824,65 +1193,50 @@ void sendStreamToBackend() {
   if (!backendEnabled) return;
   if (emergencyTriggered && !debugMode) return;
 
-  streamAttemptCount++;
+  enqueueCurrentSampleForStream();
+  ensureStreamWebSocketConnection();
 
-  StaticJsonDocument<512> req;
-
-  JsonObject sample = req.createNestedObject("sample");
-  String apiTs;
-  if (getIsoTimestampForApi(apiTs)) {
-    sample["timestamp"] = apiTs;
-  }
-  req["esp_model_version"] = modelVersion;
-  req["esp_model_checksum"] = modelChecksum;
-  sample["accMag"] = accMag;
-  sample["gyroMag"] = gyroMag;
-  sample["gx"] = gx;
-  sample["gy"] = gy;
-  sample["gz"] = gz;
-  sample["sw420"] = digitalRead(SW420_PIN);
-
-  String payload;
-  serializeJson(req, payload);
-
-  String response;
-  String url = String(BACKEND_BASE_URL) + "/api/v1/stream";
-  int httpCode = 0;
-
-  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
+  if (streamInFlight && (millis() - streamInFlightSentAtMs > WS_ACK_TIMEOUT_MS)) {
+    streamInFlight = false;
+    streamInFlightCount = 0;
     streamFailCount++;
-    lastStreamHttpCode = httpCode;
-    if (httpCode == -1) lastStreamResult = "FAIL: WIFI_DOWN";
-    else if (httpCode == -2) lastStreamResult = "FAIL: HTTP_BEGIN";
-    else if (httpCode == -11) lastStreamResult = "FAIL: HTTP_TIMEOUT";
-    else lastStreamResult = "FAIL: HTTP_" + String(httpCode);
+    lastStreamHttpCode = -102;
+    lastStreamResult = "FAIL:WS_ACK_TIMEOUT";
+    wsConnected = false;
+    streamWebSocket.disconnect();
+  }
 
-    Serial.print("STREAM_FAIL,code=");
-    Serial.print(httpCode);
-    Serial.print(",wifi=");
-    Serial.println(WiFi.status());
-    Serial.print("STREAM_FAIL_BODY=");
-    Serial.println(response);
+  if (streamQueueCount <= 0 || streamInFlight) {
     return;
   }
 
-  streamSuccessCount++;
-  lastStreamHttpCode = httpCode;
-  lastStreamResult = "OK";
+  streamAttemptCount++;
 
-  Serial.print("STREAM_OK,code=");
-  Serial.print(httpCode);
-  Serial.print(",attempt=");
-  Serial.print(streamAttemptCount);
-  Serial.print(",success=");
-  Serial.println(streamSuccessCount);
-
-  DynamicJsonDocument doc(2048);
-  if (deserializeJson(doc, response) == DeserializationError::Ok) {
-    if (doc.containsKey("is_anomaly") && doc["is_anomaly"].as<bool>()) {
-      isMachineFailing = true;
-    }
+  int batchCount = 0;
+  String payload = buildBatchPayload(STREAM_BATCH_SIZE, batchCount);
+  if (batchCount <= 0) {
+    return;
   }
+
+  if (wsConnected) {
+    bool sent = streamWebSocket.sendTXT(payload);
+    if (sent) {
+      streamInFlight = true;
+      streamInFlightCount = batchCount;
+      streamInFlightSentAtMs = millis();
+      lastStreamHttpCode = 101;
+      lastStreamResult = "WS_SENT";
+      return;
+    }
+
+    streamFailCount++;
+    lastStreamHttpCode = -103;
+    lastStreamResult = "FAIL:WS_TX";
+    wsConnected = false;
+    streamWebSocket.disconnect();
+  }
+
+  sendBatchOverHttpFallback(batchCount);
 }
 
 void reportBackendTelemetry() {
@@ -895,7 +1249,13 @@ void reportBackendTelemetry() {
   Serial.print(",lastCode=");
   Serial.print(lastStreamHttpCode);
   Serial.print(",lastResult=");
-  Serial.println(lastStreamResult);
+  Serial.print(lastStreamResult);
+  Serial.print(",queued=");
+  Serial.print(streamQueueCount);
+  Serial.print(",dropped=");
+  Serial.print(streamDroppedCount);
+  Serial.print(",ws=");
+  Serial.println(wsConnected ? "1" : "0");
 }
 
 // -------------------- Blynk handlers --------------------
@@ -947,6 +1307,52 @@ BLYNK_WRITE(V21) {
   Serial.println(ledManualOn ? "ON" : "OFF");
 }
 
+// V22: SW420 threshold seconds
+BLYNK_WRITE(V22) {
+  int v = param.asInt();
+  if (v < 1) v = 1;
+  if (v > 300) v = 300;
+  sw420ThresholdSec = v;
+
+  if (sw420ThresholdSec >= sw420FrameSec) {
+    sw420ThresholdSec = sw420FrameSec - 1;
+    if (sw420ThresholdSec < 1) sw420ThresholdSec = 1;
+  }
+
+  Blynk.virtualWrite(V22, sw420ThresholdSec);
+
+  Serial.print("SW420_THRESHOLD_SEC=");
+  Serial.println(sw420ThresholdSec);
+}
+
+// V23: SW420 frame seconds
+BLYNK_WRITE(V23) {
+  int v = param.asInt();
+  if (v < 2) v = 2;
+  if (v > 600) v = 600;
+  sw420FrameSec = v;
+
+  if (sw420ThresholdSec >= sw420FrameSec) {
+    sw420ThresholdSec = sw420FrameSec - 1;
+    if (sw420ThresholdSec < 1) sw420ThresholdSec = 1;
+    Blynk.virtualWrite(V22, sw420ThresholdSec);
+  }
+
+  Blynk.virtualWrite(V23, sw420FrameSec);
+
+  Serial.print("SW420_FRAME_SEC=");
+  Serial.println(sw420FrameSec);
+}
+
+// V27: debug mode switch (1=debug ON, 0=production OFF)
+BLYNK_WRITE(V27) {
+  debugMode = (param.asInt() == 1);
+  Blynk.virtualWrite(V27, debugMode ? 1 : 0);
+
+  Serial.print("DEBUG_MODE=");
+  Serial.println(debugMode ? "ON" : "OFF");
+}
+
 // -------------------- Main tasks --------------------
 
 void readSensorsAndPredict() {
@@ -975,7 +1381,7 @@ void readSensorsAndPredict() {
     Blynk.logEvent("machine_alert", "AI anomaly detected by local edge inference");
   }
 
-  // Serial output restored (for plotting/IA pipeline)
+  // Serial output
   Serial.print(accMag);      Serial.print(",");
   Serial.print(gyroMag);     Serial.print(",");
   Serial.print(gx);          Serial.print(",");
@@ -1002,6 +1408,11 @@ void updateBlynk() {
   Blynk.virtualWrite(V15, fanOn ? 1 : 0);
   Blynk.virtualWrite(V20, buzzerManualOn ? 1 : 0);
   Blynk.virtualWrite(V21, ledManualOn ? 1 : 0);
+
+  // keep sliders/switch synced
+  Blynk.virtualWrite(V22, sw420ThresholdSec);
+  Blynk.virtualWrite(V23, sw420FrameSec);
+  Blynk.virtualWrite(V27, debugMode ? 1 : 0);
 
   Blynk.virtualWrite(V16, (int)streamSuccessCount);
   Blynk.virtualWrite(V17, (int)streamFailCount);
@@ -1055,6 +1466,7 @@ void setup() {
   pinMode(RELAY_FAN_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
+
   motorOn = true;
   fanOn = true;
   buzzerManualOn = false;
@@ -1098,7 +1510,21 @@ void setup() {
   updateCalibrationRuntime("idle", 0, "Ready", false);
   Serial.println("S8: model loaded");
 
-  // Full timers restored
+  configureStreamWebSocket();
+
+  // init SW420 frame timers
+  sw420FrameStartMs = millis();
+  sw420LastSampleMs = millis();
+
+  // push defaults
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V22, sw420ThresholdSec);
+    Blynk.virtualWrite(V23, sw420FrameSec);
+    Blynk.virtualWrite(V27, debugMode ? 1 : 0);
+    Blynk.virtualWrite(V26, "INIT | waiting first frame");
+  }
+
+  // Timers
   timer.setInterval(100L, readSensorsAndPredict);
   timer.setInterval(1000L, updateBlynk);
   timer.setInterval(1000L, sendStreamToBackend);
@@ -1117,36 +1543,25 @@ void setup() {
 
 void loop() {
   ensureWiFiConnection();
+  streamWebSocket.loop();
+  ensureStreamWebSocketConnection();
 
   processSw420Trigger();
 
   if (sw420FaultLatched && !sw420FaultAnnounced) {
     if (!debugMode) {
-      Blynk.logEvent("critical_failure", "SW-420 hardware kill switch activated");
-      Serial.println("EMERGENCY SHUTDOWN: SW-420 trigger window exceeded");
+      Blynk.logEvent("critical_failure", "SW420 frame threshold exceeded");
+      Serial.println("EMERGENCY WARNING: SW420 frame threshold exceeded");
       Blynk.virtualWrite(V5, 1);
+      Blynk.virtualWrite(V26, "FAIL | LATCHED");
     } else {
-      Serial.println("DEBUG WARNING: SW-420 trigger window exceeded (shutdown bypassed)");
+      Serial.println("DEBUG WARNING: SW420 frame threshold exceeded (shutdown bypassed)");
     }
     sw420FaultAnnounced = true;
   }
 
-  if (sw420FaultLatched && !debugMode) {
-    motorOn = false;
-    fanOn = false;
-    buzzerManualOn = false;
-    ledManualOn = false;
-
-    updateAlertOutputs();
-
-    while (true) {
-      digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
-      digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
-      digitalWrite(LED_PIN, LED_OFF);
-      digitalWrite(BUZZER_PIN, BUZZER_OFF);
-      delay(150);
-    }
-  }
+  // IMPORTANT: no hard infinite lock here, so 5s buzzer window can run
+  // and then outputs are cut in updateAlertOutputs() when debugMode=false.
 
   if (WiFi.status() == WL_CONNECTED) {
     if (!Blynk.connected() && (millis() - lastBlynkConnectAttemptMs) > BLYNK_RECONNECT_INTERVAL_MS) {
@@ -1169,6 +1584,12 @@ void loop() {
     Serial.print(" acc=");
     Serial.print(accMag);
     Serial.print(" fail=");
-    Serial.println(isMachineFailing ? "1" : "0");
+    Serial.print(isMachineFailing ? "1" : "0");
+    Serial.print(" debug=");
+    Serial.print(debugMode ? "1" : "0");
+    Serial.print(" th=");
+    Serial.print(sw420ThresholdSec);
+    Serial.print(" frame=");
+    Serial.println(sw420FrameSec);
   }
 }

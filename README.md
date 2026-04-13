@@ -53,7 +53,7 @@ Profiles represent target machines/devices with calibration defaults. Both dashb
 
 ### 2) Stream binding controls ingest routing
 
-`POST /api/v1/stream` accepts ESP IDs for compatibility, but backend routing is determined by active stream binding:
+`POST /api/v1/stream` and `WS /api/v1/ws/stream` accept ESP payloads for compatibility, but backend routing is determined by active stream binding:
 - If binding is active: samples route to bound profile machine/device
 - If no binding: samples route to unassigned target
     - `MACHINOCARE_UNASSIGNED_MACHINE_ID` (default: `unassigned_machine`)
@@ -76,7 +76,7 @@ Auto-detected backend:
 
 ```mermaid
 flowchart LR
-    ESP[ESP32 Firmware\nMPU6050 + SW420 + Relays] -->|POST /api/v1/stream| API[FastAPI Backend]
+    ESP[ESP32 Firmware\nMPU6050 + SW420 + Relays] -->|WS /api/v1/ws/stream\nor POST /api/v1/stream| API[FastAPI Backend]
     API --> STORE[(SQLite / PostgreSQL)]
     API -->|WS /api/v1/ws/live| DBG[Realtime Debug Dashboard]
     API -->|REST| ST[Streamlit Dashboard]
@@ -122,6 +122,7 @@ stateDiagram-v2
 ### Backend
 
 - Real-time stream ingest (`sample` and batch `samples`)
+- WebSocket stream ingest with ACK/error responses (`WS /api/v1/ws/stream`)
 - Synchronous and asynchronous calibration
 - Device-specific model packaging and retrieval
 - Status and anomaly logging
@@ -152,6 +153,7 @@ stateDiagram-v2
 - SW420 emergency behavior path
 - Blynk telemetry/control integration
 - ThingSpeak publishing
+- Batched backend streaming over WebSocket with HTTP fallback
 - Backend stream and model pull support
 
 ## Quick Start (Local)
@@ -239,6 +241,7 @@ Base prefix: `/api/v1`
 ### Streaming and status
 
 - `POST /stream`
+- `WS /ws/stream`
 - `GET /stream/{machine_id}/recent`
 - `GET /status/{machine_id}`
 - `GET /status/{machine_id}/{device_id}`
@@ -305,6 +308,15 @@ Before flashing, replace placeholders:
 
 Firmware no longer depends on hardcoded `MACHINE_ID`/`DEVICE_ID` constants for stream upload.
 Incoming routing is profile-driven using backend stream binding.
+
+Streaming transport (current firmware):
+- Primary: WebSocket ingest (`/api/v1/ws/stream`)
+- Fallback: HTTP ingest (`POST /api/v1/stream`)
+- Batch size: 5 samples per send attempt
+- In-memory queue capacity: 30 samples
+- ACK timeout fallback to HTTP batch resend
+
+Calibration defaults in firmware now use `sample_rate_hz = 1` to match the 1 Hz stream timer.
 
 Pin mapping (current):
 - `SW420_PIN = 34`
