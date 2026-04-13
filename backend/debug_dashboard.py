@@ -921,6 +921,8 @@ def get_debug_dashboard_html() -> str:
       setProfileSwitching(false);
     }
 
+    async function saveProfile() {
+      const profile = currentProfile();
       if (!profile) {
         el('profileHint').textContent = 'Select a profile before saving.';
         return;
