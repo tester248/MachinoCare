@@ -624,7 +624,6 @@ with st.sidebar:
                         str(create_data.get("machine_id") or ""),
                         str(create_data.get("device_id") or ""),
                     )
-                    st.session_state.new_profile_display_name = ""
                     st.success(f"Created profile {create_data.get('display_name') or create_name}")
                     st.rerun()
 
@@ -703,6 +702,10 @@ with st.sidebar:
 def render_live_ui() -> None:
     if st.session_state.selected_profile_key is None:
         st.info("Select or create a profile to start live monitoring.")
+        return
+
+    if not selected_device_name:
+        st.warning("Selected profile is missing a display name. Update the profile name to continue.")
         return
 
     active_job_data = None

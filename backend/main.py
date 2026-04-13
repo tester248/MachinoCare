@@ -1155,8 +1155,7 @@ def health() -> dict[str, str]:
     }
 
 
-@router.post("/stream", status_code=202)
-def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
+def _ingest_stream_payload(payload: StreamIngestRequest) -> dict[str, Any]:
     samples = [sample_to_record(sample) for sample in payload.expanded_samples()]
     if not samples:
         raise HTTPException(status_code=400, detail="No samples provided.")
@@ -1278,6 +1277,11 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
         "esp_model_version": state.get("esp_model_version"),
         "esp_model_checksum": state.get("esp_model_checksum"),
     }
+
+
+@router.post("/stream", status_code=202)
+def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
+    return _ingest_stream_payload(payload)
 
 
 @router.post("/calibrate/start", response_model=CalibrationStartResponse)
@@ -1675,6 +1679,75 @@ def debug_logs(
         "count": len(logs),
         "logs": [ApiDebugLogEntry(**item).model_dump() for item in logs],
     }
+
+
+@router.websocket("/ws/stream")
+async def ws_stream_ingest(websocket: WebSocket) -> None:
+    await websocket.accept()
+    await websocket.send_json(
+        {
+            "type": "connected",
+            "message": "WebSocket stream ingest ready",
+            "server_timestamp": utc_iso_now(),
+        }
+    )
+
+    while True:
+        try:
+            raw_text = await websocket.receive_text()
+        except WebSocketDisconnect:
+            break
+
+        try:
+            decoded = json.loads(raw_text)
+        except json.JSONDecodeError:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "status_code": 400,
+                    "detail": "Invalid JSON payload.",
+                    "server_timestamp": utc_iso_now(),
+                }
+            )
+            continue
+
+        if isinstance(decoded, dict) and decoded.get("type") == "ping":
+            await websocket.send_json({"type": "pong", "server_timestamp": utc_iso_now()})
+            continue
+
+        try:
+            payload = StreamIngestRequest.model_validate(decoded)
+            last_sequence = None
+            expanded = payload.expanded_samples()
+            if expanded:
+                last_sequence = expanded[-1].sequence
+
+            result = _ingest_stream_payload(payload)
+            await websocket.send_json(
+                {
+                    "type": "ack",
+                    "ack_sequence": last_sequence,
+                    **result,
+                }
+            )
+        except HTTPException as exc:
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "status_code": exc.status_code,
+                    "detail": exc.detail,
+                    "server_timestamp": utc_iso_now(),
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            await websocket.send_json(
+                {
+                    "type": "error",
+                    "status_code": 500,
+                    "detail": str(exc),
+                    "server_timestamp": utc_iso_now(),
+                }
+            )
 
 
 @router.websocket("/ws/live")
