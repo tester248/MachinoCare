@@ -1,6 +1,6 @@
 // ============================================================
 // MachinoCare - FINAL COMBINED (NO SECRETS)
-// AI + Failsafe + Cloud + Backend + ThingSpeak + Blynk Relay Control
+// AI + Failsafe + Cloud + Backend + ThingSpeak + Blynk LED/Buzzer Control
 // (No physical buttons)
 // ============================================================
 
@@ -30,9 +30,9 @@ WiFiClient tsClient;
 
 // Backend settings
 const char* BACKEND_BASE_URL = "https://YOUR_BACKEND_URL";
-const char* MACHINE_ID = "YOUR_MACHINE_ID";
-const char* DEVICE_ID = "YOUR_DEVICE_ID";
 bool backendEnabled = true;
+String activeBindingMachineId = "";
+String activeBindingDeviceId = "";
 
 // NTP settings
 const char* ntpServer = "pool.ntp.org";
@@ -41,14 +41,15 @@ const int daylightOffset_sec = 0;
 
 // Hardware pins
 const int SW420_PIN = 34;
-const int RELAY_MOTOR_PIN = 25; // IN1
-const int RELAY_FAN_PIN   = 26; // IN2
+const int BUZZER_PIN = 25;
+const int LED_PIN = 27;
 
-// Relay polarity (most 2-ch modules are active LOW)
-const int RELAY_ON  = LOW;
-const int RELAY_OFF = HIGH;
+const int BUZZER_ON = HIGH;
+const int BUZZER_OFF = LOW;
+const int LED_ON = HIGH;
+const int LED_OFF = LOW;
 
-// true = don't hard-cut relays on SW420 trigger, false = production kill
+// true = don't hard-cut outputs on SW420 trigger, false = production kill
 volatile bool debugMode = true;
 
 MPU6050 mpu;
@@ -66,9 +67,9 @@ float aiThreshold = 25000.0;
 volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
 
-// Relay state
-bool motorOn = true;
-bool fanOn   = true;
+// Indicator control state
+bool buzzerManualOn = false;
+bool ledManualOn = false;
 
 // ThingSpeak window stats
 float accSum = 0;
@@ -105,6 +106,14 @@ unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
 
+unsigned long lastWiFiReconnectAttemptMs = 0;
+unsigned long lastBlynkConnectAttemptMs = 0;
+unsigned long lastBindingRefreshMs = 0;
+
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long BLYNK_RECONNECT_INTERVAL_MS = 5000;
+const unsigned long BINDING_REFRESH_INTERVAL_MS = 30000;
+
 // Feature window
 const int WINDOW_SIZE = 10;
 float accWindow[WINDOW_SIZE] = {0};
@@ -120,9 +129,35 @@ const int MODEL_HTTP_TIMEOUT_MS = 2500;
 
 // -------------------- Helpers --------------------
 
-void applyRelays() {
-  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
+void applyIndicators() {
+  digitalWrite(BUZZER_PIN, buzzerManualOn ? BUZZER_ON : BUZZER_OFF);
+  digitalWrite(LED_PIN, ledManualOn ? LED_ON : LED_OFF);
+}
+
+void updateAlertOutputs() {
+  bool alertActive = isMachineFailing || (emergencyTriggered && !debugMode);
+  bool ledState = ledManualOn || alertActive;
+  bool buzzerState = buzzerManualOn;
+
+  if (alertActive) {
+    // Pulse buzzer on alerts so it is noticeable without being continuously harsh.
+    buzzerState = ((millis() / 220) % 2) == 0;
+  }
+
+  digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
+  digitalWrite(BUZZER_PIN, buzzerState ? BUZZER_ON : BUZZER_OFF);
+}
+
+void ensureWiFiConnection() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  unsigned long now = millis();
+  if (now - lastWiFiReconnectAttemptMs < WIFI_RECONNECT_INTERVAL_MS) return;
+
+  lastWiFiReconnectAttemptMs = now;
+  Serial.print("WIFI_RECONNECT,status=");
+  Serial.println((int)WiFi.status());
+  WiFi.reconnect();
 }
 
 void updateCalibrationRuntime(const String& stage, int progress, const String& message, bool inProgress) {
@@ -154,8 +189,8 @@ void resetRuntimeForFreshCalibration() {
 
 void IRAM_ATTR emergencyKillSwitch() {
   if (!debugMode) {
-    digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
-    digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
+    digitalWrite(LED_PIN, LED_ON);
+    digitalWrite(BUZZER_PIN, BUZZER_ON);
   }
   emergencyTriggered = true;
 }
@@ -277,15 +312,30 @@ bool evaluateLocalAI() {
 }
 
 bool httpPostJson(const String& url, const String& payload, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
-  if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
+  if (!backendEnabled) {
     if (statusCodeOut) *statusCodeOut = -1;
     return false;
   }
 
-  HTTPClient http;
-  apiClient.setInsecure();
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiConnection();
+    if (WiFi.status() != WL_CONNECTED) {
+      if (statusCodeOut) *statusCodeOut = -1;
+      return false;
+    }
+  }
 
-  if (!http.begin(apiClient, url)) {
+  HTTPClient http;
+  bool beginOk = false;
+  if (url.startsWith("https://")) {
+    apiClient.setInsecure();
+    beginOk = http.begin(apiClient, url);
+  } else {
+    WiFiClient plainClient;
+    beginOk = http.begin(plainClient, url);
+  }
+
+  if (!beginOk) {
     if (statusCodeOut) *statusCodeOut = -2;
     return false;
   }
@@ -304,15 +354,30 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
 }
 
 bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
-  if (!backendEnabled || WiFi.status() != WL_CONNECTED) {
+  if (!backendEnabled) {
     if (statusCodeOut) *statusCodeOut = -1;
     return false;
   }
 
-  HTTPClient http;
-  apiClient.setInsecure();
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiConnection();
+    if (WiFi.status() != WL_CONNECTED) {
+      if (statusCodeOut) *statusCodeOut = -1;
+      return false;
+    }
+  }
 
-  if (!http.begin(apiClient, url)) {
+  HTTPClient http;
+  bool beginOk = false;
+  if (url.startsWith("https://")) {
+    apiClient.setInsecure();
+    beginOk = http.begin(apiClient, url);
+  } else {
+    WiFiClient plainClient;
+    beginOk = http.begin(plainClient, url);
+  }
+
+  if (!beginOk) {
     if (statusCodeOut) *statusCodeOut = -2;
     return false;
   }
@@ -326,6 +391,63 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
 
   http.end();
   return (code >= 200 && code < 300);
+}
+
+bool refreshActiveBinding(bool force = false) {
+  unsigned long now = millis();
+  if (!force && (now - lastBindingRefreshMs) < BINDING_REFRESH_INTERVAL_MS) {
+    return activeBindingMachineId.length() > 0 && activeBindingDeviceId.length() > 0;
+  }
+  lastBindingRefreshMs = now;
+
+  String response;
+  int httpCode = 0;
+  String url = String(BACKEND_BASE_URL) + "/api/v1/stream-binding";
+  if (!httpGetJson(url, response, MODEL_HTTP_TIMEOUT_MS, &httpCode)) {
+    if (httpCode > 0) {
+      Serial.print("BINDING_FETCH_FAIL,http=");
+      Serial.println(httpCode);
+    }
+    return false;
+  }
+
+  DynamicJsonDocument doc(3072);
+  if (deserializeJson(doc, response) != DeserializationError::Ok) {
+    Serial.println("BINDING_PARSE_FAIL");
+    return false;
+  }
+
+  bool isActive = doc["is_active"] | false;
+  if (!isActive) {
+    activeBindingMachineId = "";
+    activeBindingDeviceId = "";
+    return false;
+  }
+
+  String machine = String((const char*)(doc["machine_id"] | ""));
+  String device = String((const char*)(doc["device_id"] | ""));
+  if (machine.length() == 0 || device.length() == 0) {
+    activeBindingMachineId = "";
+    activeBindingDeviceId = "";
+    return false;
+  }
+
+  bool changed = (machine != activeBindingMachineId) || (device != activeBindingDeviceId);
+  activeBindingMachineId = machine;
+  activeBindingDeviceId = device;
+
+  if (changed) {
+    Serial.print("BINDING_ACTIVE,machine=");
+    Serial.print(activeBindingMachineId);
+    Serial.print(",device=");
+    Serial.println(activeBindingDeviceId);
+  }
+
+  return true;
+}
+
+void refreshActiveBindingTask() {
+  refreshActiveBinding(false);
 }
 
 // -------------------- Model persistence --------------------
@@ -416,12 +538,21 @@ void pushCalibrationToBlynk() {
 }
 
 bool startCalibrationJobOnBackend(bool newDeviceSetup, const char* triggerSource) {
-  if (!backendEnabled || WiFi.status() != WL_CONNECTED) return false;
+  if (!backendEnabled) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    ensureWiFiConnection();
+    if (WiFi.status() != WL_CONNECTED) return false;
+  }
   if (calibrationInProgress) return true;
 
+  if (!refreshActiveBinding(true)) {
+    updateCalibrationRuntime("failed", 100, "No active stream binding/profile", false);
+    return false;
+  }
+
   StaticJsonDocument<768> req;
-  req["machine_id"] = MACHINE_ID;
-  req["device_id"] = DEVICE_ID;
+  req["machine_id"] = activeBindingMachineId;
+  req["device_id"] = activeBindingDeviceId;
   req["sample_rate_hz"] = 10;
   req["window_seconds"] = 1;
   req["fallback_seconds"] = 300;
@@ -497,8 +628,13 @@ void pollCalibrationJobStatus() {
 void pullModelPackageFromBackend() {
   if (!backendEnabled) return;
 
+  if (!refreshActiveBinding(true)) {
+    Serial.println("Model pull skipped: no active stream binding");
+    return;
+  }
+
   String response;
-  String url = String(BACKEND_BASE_URL) + "/api/v1/model/" + String(MACHINE_ID) + "/" + String(DEVICE_ID);
+  String url = String(BACKEND_BASE_URL) + "/api/v1/model/" + activeBindingMachineId + "/" + activeBindingDeviceId;
 
   if (!httpGetJson(url, response, MODEL_HTTP_TIMEOUT_MS)) {
     Serial.println("Backend model pull failed");
@@ -539,8 +675,6 @@ void sendStreamToBackend() {
   streamAttemptCount++;
 
   StaticJsonDocument<512> req;
-  req["machine_id"] = MACHINE_ID;
-  req["device_id"] = DEVICE_ID;
 
   JsonObject sample = req.createNestedObject("sample");
   sample["timestamp"] = getTimeString();
@@ -623,20 +757,20 @@ BLYNK_WRITE(V13) {
   calibrationAsNewDevice = (param.asInt() == 1);
 }
 
-// V14: motor relay
+// V14: buzzer
 BLYNK_WRITE(V14) {
-  motorOn = (param.asInt() == 1);
-  applyRelays();
-  Serial.print("BLYNK_MOTOR,");
-  Serial.println(motorOn ? "ON" : "OFF");
+  buzzerManualOn = (param.asInt() == 1);
+  applyIndicators();
+  Serial.print("BLYNK_BUZZER,");
+  Serial.println(buzzerManualOn ? "ON" : "OFF");
 }
 
-// V15: fan relay
+// V15: LED
 BLYNK_WRITE(V15) {
-  fanOn = (param.asInt() == 1);
-  applyRelays();
-  Serial.print("BLYNK_FAN,");
-  Serial.println(fanOn ? "ON" : "OFF");
+  ledManualOn = (param.asInt() == 1);
+  applyIndicators();
+  Serial.print("BLYNK_LED,");
+  Serial.println(ledManualOn ? "ON" : "OFF");
 }
 
 // -------------------- Main tasks --------------------
@@ -688,8 +822,8 @@ void updateBlynk() {
   Blynk.virtualWrite(V6, getTimeString());
   Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
 
-  Blynk.virtualWrite(V14, motorOn ? 1 : 0);
-  Blynk.virtualWrite(V15, fanOn ? 1 : 0);
+  Blynk.virtualWrite(V14, buzzerManualOn ? 1 : 0);
+  Blynk.virtualWrite(V15, ledManualOn ? 1 : 0);
 
   Blynk.virtualWrite(V16, (int)streamSuccessCount);
   Blynk.virtualWrite(V17, (int)streamFailCount);
@@ -739,21 +873,40 @@ void setup() {
   Serial.println("S3: mpu");
 
   pinMode(SW420_PIN, INPUT);
-  pinMode(RELAY_MOTOR_PIN, OUTPUT);
-  pinMode(RELAY_FAN_PIN, OUTPUT);
-
-  motorOn = true;
-  fanOn = true;
-  applyRelays();
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  buzzerManualOn = false;
+  ledManualOn = false;
+  applyIndicators();
   Serial.println("S4: pins");
 
   attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, RISING);
   Serial.println("S5: interrupt");
 
-  // Non-blocking WiFi + Blynk
+  // Stable WiFi setup
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
   WiFi.begin(ssid, password);
+  unsigned long wifiWaitStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiWaitStart < 8000) {
+    delay(200);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("S6: wifi connected, ip=");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("S6: wifi pending, retry in loop");
+  }
+
   Blynk.config(BLYNK_AUTH_TOKEN);
-  Serial.println("S6: wifi+blynk config");
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.connect(1500);
+  }
+  Serial.println("S6b: blynk configured");
 
   ThingSpeak.begin(tsClient);
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
@@ -769,7 +922,9 @@ void setup() {
   timer.setInterval(1000L, sendStreamToBackend);
   timer.setInterval(5000L, reportBackendTelemetry);
   timer.setInterval(16000L, updateThingSpeak);
+  timer.setInterval(BINDING_REFRESH_INTERVAL_MS, refreshActiveBindingTask);
 
+  timer.setTimeout(6000L, refreshActiveBindingTask);
   timer.setTimeout(15000L, pullModelPackageFromBackend);
   timer.setInterval(300000L, pullModelPackageFromBackend);      // 5 min
   timer.setInterval(1800000L, requestCalibrationFromBackend);   // 30 min
@@ -779,17 +934,24 @@ void setup() {
 }
 
 void loop() {
+  ensureWiFiConnection();
+
   if (emergencyTriggered) {
     if (!debugMode) {
-      motorOn = false;
-      fanOn = false;
-      applyRelays();
+      buzzerManualOn = false;
+      ledManualOn = false;
+      digitalWrite(LED_PIN, LED_ON);
+      digitalWrite(BUZZER_PIN, BUZZER_ON);
 
       Blynk.logEvent("critical_failure", "SW-420 hardware kill switch activated");
       Serial.println("EMERGENCY SHUTDOWN: system locked");
       Blynk.virtualWrite(V5, 1);
 
-      while (true) delay(1000);
+      while (true) {
+        digitalWrite(LED_PIN, LED_ON);
+        digitalWrite(BUZZER_PIN, BUZZER_ON);
+        delay(150);
+      }
     } else {
       Serial.println("DEBUG WARNING: SW-420 trigger detected (shutdown bypassed)");
       emergencyTriggered = false;
@@ -797,10 +959,15 @@ void loop() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    if (!Blynk.connected() && (millis() - lastBlynkConnectAttemptMs) > BLYNK_RECONNECT_INTERVAL_MS) {
+      lastBlynkConnectAttemptMs = millis();
+      Blynk.connect(600);
+    }
     Blynk.run();
   }
 
   timer.run();
+  updateAlertOutputs();
 
   static unsigned long t = 0;
   if (millis() - t > 3000) {
