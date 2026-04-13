@@ -438,6 +438,7 @@ with st.sidebar:
         st.info("Create your first profile to start monitoring and calibration.")
         st.session_state.selected_profile_key = None
 
+    selected_device_name = str((selected_profile or {}).get("display_name_raw") or "").strip()
     selected_machine = selected_profile["machine_id"] if selected_profile else UNASSIGNED_MACHINE_ID
     selected_device = selected_profile["device_id"] if selected_profile else UNASSIGNED_DEVICE_ID
 
@@ -470,8 +471,7 @@ with st.sidebar:
             f"{api_base}/api/v1/stream-binding",
             method="POST",
             payload={
-                "machine_id": selected_machine,
-                "device_id": selected_device,
+                "device_name": selected_device_name,
                 "source": "streamlit_dashboard",
             },
         )
@@ -618,7 +618,7 @@ with st.sidebar:
                 query = "true" if bool(new_device_setup) else "false"
                 start_data, start_error = request_json(
                     (
-                        f"{api_base}/api/v1/calibrate/start/profile/{selected_machine}/{selected_device}"
+                        f"{api_base}/api/v1/calibrate/start/profile/{selected_device_name}"
                         f"?new_device_setup={query}&trigger_source=dashboard_ui"
                     ),
                     method="POST",
@@ -659,7 +659,7 @@ with st.sidebar:
             st.error("Enable profile delete confirmation before removing a profile.")
         else:
             _, delete_error = request_json(
-                f"{api_base}/api/v1/device-profiles/{selected_machine}/{selected_device}",
+                f"{api_base}/api/v1/device-profiles/{selected_device_name}",
                 method="DELETE",
             )
             if delete_error:
@@ -683,18 +683,18 @@ def render_live_ui() -> None:
             st.session_state.completed_job = dict(active_job_data)
             st.session_state.active_job_id = None
 
-    status_data, status_error = request_json(f"{api_base}/api/v1/status/{selected_machine}/{selected_device}")
+    status_data, status_error = request_json(f"{api_base}/api/v1/status/{selected_device_name}")
     insight_data, insight_error = request_json(
-        f"{api_base}/api/v1/insights/{selected_machine}/{selected_device}",
+        f"{api_base}/api/v1/insights/{selected_device_name}",
         timeout=15,
     )
     recent_data, recent_error = request_json(
-        f"{api_base}/api/v1/stream/{selected_machine}/recent?seconds={lookback_seconds}&limit=5000&device_id={selected_device}"
+        f"{api_base}/api/v1/stream/recent/{selected_device_name}?seconds={lookback_seconds}&limit=5000"
     )
     debug_logs_data, debug_logs_error = request_json(
         (
             f"{api_base}/api/v1/debug/logs"
-            f"?machine_id={selected_machine}&device_id={selected_device}&limit=120"
+            f"?device_name={selected_device_name}&limit=120"
         )
     )
 
@@ -919,7 +919,7 @@ def render_live_ui() -> None:
             ):
                 with st.spinner("Regenerating report..."):
                     regenerated, regen_error = request_json(
-                        f"{api_base}/api/v1/insights/{selected_machine}/{selected_device}/regenerate",
+                        f"{api_base}/api/v1/insights/{selected_device_name}/regenerate",
                         method="POST",
                         timeout=30,
                     )
