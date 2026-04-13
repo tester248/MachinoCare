@@ -211,7 +211,16 @@ def get_debug_dashboard_html() -> str:
       </section>
 
       <section class="card chart">
-        <div id="chart" style="height:420px;"></div>
+        <div class="row" style="justify-content:space-between; margin-bottom:0.4rem;">
+          <h3 style="margin:0;">Live Magnitudes</h3>
+          <span class="hint">acc_mag, gyro_mag, score, threshold</span>
+        </div>
+        <div id="chartMagnitudes" style="height:300px;"></div>
+        <div class="row" style="justify-content:space-between; margin:0.75rem 0 0.4rem;">
+          <h3 style="margin:0;">Live XYZ / SW420</h3>
+          <span class="hint">gx, gy, gz, sw420</span>
+        </div>
+        <div id="chartAxes" style="height:300px;"></div>
       </section>
 
       <section class="card profiles">
@@ -305,6 +314,9 @@ def get_debug_dashboard_html() -> str:
       { key: 'score', label: 'score', color: '#b91c1c' },
       { key: 'decision_threshold', label: 'decision_threshold', color: '#0f172a' }
     ];
+
+    const magnitudeFieldKeys = ['acc_mag', 'gyro_mag', 'score', 'decision_threshold'];
+    const axisFieldKeys = ['gx', 'gy', 'gz', 'sw420'];
 
     const thingSpeakColors = {
       field1: '#1d4ed8',
@@ -556,11 +568,12 @@ def get_debug_dashboard_html() -> str:
       if (timestamps.length > 600) timestamps.shift();
     }
 
-    function renderChart() {
+    function renderChartPanel(targetId, allowedKeys, yAxisTitle, emptyMessage) {
       const fields = selectedFields();
       const plotData = [];
+
       for (const cfg of fieldConfig) {
-        if (!fields.includes(cfg.key)) continue;
+        if (!allowedKeys.includes(cfg.key) || !fields.includes(cfg.key)) continue;
         plotData.push({
           x: timestamps,
           y: traces[cfg.key] || [],
@@ -570,14 +583,43 @@ def get_debug_dashboard_html() -> str:
         });
       }
 
-      Plotly.react('chart', plotData, {
+      const layout = {
         margin: { l: 42, r: 18, t: 30, b: 35 },
         template: 'plotly_white',
         legend: { orientation: 'h' },
         xaxis: { title: 'timestamp' },
-        yaxis: { title: 'value' },
+        yaxis: { title: yAxisTitle },
         hovermode: 'x unified'
-      }, { displayModeBar: true, responsive: true });
+      };
+
+      if (plotData.length === 0) {
+        layout.annotations = [{
+          text: emptyMessage,
+          showarrow: false,
+          x: 0.5,
+          y: 0.5,
+          xref: 'paper',
+          yref: 'paper',
+          font: { color: '#64748b', size: 13 }
+        }];
+      }
+
+      Plotly.react(targetId, plotData, layout, { displayModeBar: true, responsive: true });
+    }
+
+    function renderChart() {
+      renderChartPanel(
+        'chartMagnitudes',
+        magnitudeFieldKeys,
+        'magnitude / score',
+        'Waiting for live magnitude samples...'
+      );
+      renderChartPanel(
+        'chartAxes',
+        axisFieldKeys,
+        'axis / sensor value',
+        'Waiting for live XYZ samples...'
+      );
     }
 
     function updateStatus(status) {
