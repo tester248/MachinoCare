@@ -217,6 +217,23 @@ String getTimeString() {
   return String(buff);
 }
 
+bool getIsoTimestampForApi(String& out) {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return false;
+
+  char buff[32];
+  strftime(buff, sizeof(buff), "%Y-%m-%dT%H:%M:%S%z", &timeinfo);
+  String ts(buff);
+
+  // Convert +0530 to +05:30 for strict ISO8601 parsers.
+  if (ts.length() >= 5) {
+    ts = ts.substring(0, ts.length() - 2) + ":" + ts.substring(ts.length() - 2);
+  }
+
+  out = ts;
+  return true;
+}
+
 void pushWindowSample(float aMag, float gMag, float x, float y, float z) {
   accWindow[windowPos] = aMag;
   gyroWindow[windowPos] = gMag;
@@ -691,7 +708,10 @@ void sendStreamToBackend() {
   StaticJsonDocument<512> req;
 
   JsonObject sample = req.createNestedObject("sample");
-  sample["timestamp"] = getTimeString();
+  String apiTs;
+  if (getIsoTimestampForApi(apiTs)) {
+    sample["timestamp"] = apiTs;
+  }
   sample["accMag"] = accMag;
   sample["gyroMag"] = gyroMag;
   sample["gx"] = gx;
