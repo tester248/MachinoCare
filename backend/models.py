@@ -81,6 +81,7 @@ class CalibrationRequest(BaseModel):
     fallback_seconds: int = Field(default=300, ge=10, le=86400)
     calibration_duration_seconds: int | None = Field(default=None, ge=10, le=86400)
     contamination: float = Field(default=0.05, ge=0.01, le=0.40)
+    model_variant: str = Field(default="ocsvm_distilled", min_length=1, max_length=64)
     min_consecutive_windows: int = Field(default=3, ge=1, le=10)
     new_device_setup: bool = False
     trigger_source: str = Field(default="manual", min_length=1, max_length=64)

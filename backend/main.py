@@ -26,6 +26,7 @@ from backend.ml_engine import (
     latest_feature_vector,
     score_feature_vector,
     train_isolation_forest_distilled,
+    train_oneclass_svm_distilled,
 )
 from backend.models import (
     ApiDebugLogEntry,
@@ -64,7 +65,7 @@ LIVE_PUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("MACHINOCARE_LIVE_PUSH_INT
 UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
 UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
 GROQ_API_KEY = _get_env_var("GROQ_API_KEY", "MACHINOCARE_GROQ_API_KEY")
-GROQ_MODEL = _get_env_var("MACHINOCARE_GROQ_MODEL", "GROQ_MODEL", default="meta-llama/llama-prompt-guard-2-86m")
+GROQ_MODEL = _get_env_var("MACHINOCARE_GROQ_MODEL", "GROQ_MODEL", default="llama-3.3-70b-versatile")
 GROQ_API_URL = _get_env_var(
     "MACHINOCARE_GROQ_API_URL",
     "GROQ_API_URL",
@@ -682,6 +683,99 @@ def sample_to_record(sample: Any) -> dict[str, Any]:
     }
 
 
+def _sanitize_training_sample(record: dict[str, Any]) -> dict[str, float]:
+    """Whitelist only accel/gyro features for model training."""
+    return {
+        "acc_mag": float(record.get("acc_mag", 0.0)),
+        "gyro_mag": float(record.get("gyro_mag", 0.0)),
+        "gx": float(record.get("gx", 0.0)),
+        "gy": float(record.get("gy", 0.0)),
+        "gz": float(record.get("gz", 0.0)),
+    }
+
+
+def _assess_calibration_quality(
+    samples: list[dict[str, float]],
+    *,
+    sample_rate_hz: int,
+    collection_seconds: int,
+) -> dict[str, Any]:
+    expected_count = max(1, int(sample_rate_hz * collection_seconds))
+    sample_count = len(samples)
+    coverage_ratio = float(sample_count / expected_count) if expected_count else 1.0
+
+    timestamps = []
+    for sample in samples:
+        raw = sample.get("timestamp")
+        if not raw:
+            continue
+        try:
+            timestamps.append(datetime.fromisoformat(str(raw)))
+        except ValueError:
+            continue
+
+    timestamps.sort()
+    deltas: list[float] = []
+    for idx in range(1, len(timestamps)):
+        deltas.append((timestamps[idx] - timestamps[idx - 1]).total_seconds())
+
+    expected_interval = 1.0 / max(1, sample_rate_hz)
+    max_allowed_gap = max(1.5, expected_interval * 5.0)
+    gap_ratio = (
+        float(sum(1 for delta in deltas if delta > max_allowed_gap) / len(deltas))
+        if deltas
+        else 0.0
+    )
+
+    acc_values = [float(sample.get("acc_mag", 0.0)) for sample in samples]
+    gyro_values = [float(sample.get("gyro_mag", 0.0)) for sample in samples]
+    acc_mean = sum(acc_values) / max(1, len(acc_values))
+    gyro_mean = sum(gyro_values) / max(1, len(gyro_values))
+    acc_var = sum((value - acc_mean) ** 2 for value in acc_values) / max(1, len(acc_values))
+    gyro_var = sum((value - gyro_mean) ** 2 for value in gyro_values) / max(1, len(gyro_values))
+    acc_std = acc_var**0.5
+    gyro_std = gyro_var**0.5
+
+    n = len(samples)
+    segment = max(1, n // 3)
+    first = samples[:segment]
+    last = samples[-segment:]
+    first_acc = sum(float(item.get("acc_mag", 0.0)) for item in first) / max(1, len(first))
+    last_acc = sum(float(item.get("acc_mag", 0.0)) for item in last) / max(1, len(last))
+    first_gyro = sum(float(item.get("gyro_mag", 0.0)) for item in first) / max(1, len(first))
+    last_gyro = sum(float(item.get("gyro_mag", 0.0)) for item in last) / max(1, len(last))
+
+    acc_drift_ratio = abs(last_acc - first_acc) / max(1.0, abs(acc_mean))
+    gyro_drift_ratio = abs(last_gyro - first_gyro) / max(1.0, abs(gyro_mean))
+
+    checks = {
+        "coverage_ok": coverage_ratio >= 0.70,
+        "continuity_ok": gap_ratio <= 0.15,
+        "variance_ok": acc_std >= 0.01 and gyro_std >= 0.005,
+        "drift_ok": acc_drift_ratio <= 0.35 and gyro_drift_ratio <= 0.50,
+    }
+    passed = all(checks.values())
+    reasons = [name for name, ok in checks.items() if not ok]
+
+    return {
+        "passed": passed,
+        "failed_checks": reasons,
+        "checks": checks,
+        "metrics": {
+            "sample_count": sample_count,
+            "expected_count": expected_count,
+            "coverage_ratio": round(coverage_ratio, 4),
+            "timestamp_gap_ratio": round(gap_ratio, 4),
+            "expected_interval_seconds": round(expected_interval, 5),
+            "max_allowed_gap_seconds": round(max_allowed_gap, 5),
+            "acc_std": round(acc_std, 6),
+            "gyro_std": round(gyro_std, 6),
+            "acc_drift_ratio": round(acc_drift_ratio, 6),
+            "gyro_drift_ratio": round(gyro_drift_ratio, 6),
+        },
+    }
+
+
 def resolve_calibration_samples(request: CalibrationRequest) -> tuple[list[dict[str, Any]], str]:
     if request.baseline_samples:
         return [sample_to_record(sample) for sample in request.baseline_samples], "payload_baseline_samples"
@@ -794,8 +888,25 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
             ),
         )
 
+    training_samples = [_sanitize_training_sample(sample) for sample in samples]
+    quality = _assess_calibration_quality(
+        samples=samples,
+        sample_rate_hz=payload.sample_rate_hz,
+        collection_seconds=collection_seconds,
+    )
+    if not quality["passed"]:
+        failed_checks = ", ".join(quality["failed_checks"]) or "unknown_quality_issue"
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Calibration data quality check failed. "
+                f"Failed checks: {failed_checks}. "
+                "Recalibrate with longer stable baseline capture."
+            ),
+        )
+
     effective_window_size = max(8, payload.sample_rate_hz * payload.window_seconds)
-    feature_matrix = build_feature_matrix(samples, window_size=effective_window_size)
+    feature_matrix = build_feature_matrix(training_samples, window_size=effective_window_size)
 
     if feature_matrix.shape[0] < 8:
         raise HTTPException(
@@ -806,17 +917,28 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
             ),
         )
 
-    distilled = train_isolation_forest_distilled(
-        feature_matrix=feature_matrix,
-        contamination=payload.contamination,
-    )
-    baseline_stats = acc_threshold_stats(samples)
+    model_variant = str(payload.model_variant or "ocsvm_distilled").strip().lower()
+    if model_variant == "if_distilled":
+        distilled = train_isolation_forest_distilled(
+            feature_matrix=feature_matrix,
+            contamination=payload.contamination,
+        )
+        model_type = "isolation_forest_distilled_linear"
+    else:
+        distilled = train_oneclass_svm_distilled(
+            feature_matrix=feature_matrix,
+            contamination=payload.contamination,
+        )
+        model_type = "oneclass_svm_distilled_linear"
+
+    baseline_stats = acc_threshold_stats(training_samples)
 
     existing = store.get_model_package(machine_id, device_id)
     new_version = int(existing["model_version"]) + 1 if existing else 1
 
     package = {
-        "model_type": "isolation_forest_distilled_linear",
+        "model_type": model_type,
+        "model_variant": model_variant,
         "model_version": new_version,
         "feature_order": FEATURE_ORDER,
         "feature_means": round_list(distilled["feature_means"]),
@@ -834,6 +956,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         "quality_correlation": round(float(distilled["quality_correlation"]), 6),
         "trained_on_windows": int(distilled["window_count"]),
         "trained_on_samples": len(samples),
+        "calibration_quality": quality,
         "created_at": utc_iso_now(),
         "target_machine_id": machine_id,
         "target_device_id": device_id,
@@ -877,6 +1000,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
             "std_acc": round(float(baseline_stats["std_acc"]), 6),
             "threshold_mean_3sigma": round(float(baseline_stats["threshold_mean_3sigma"]), 6),
             "quality_correlation": round(float(distilled["quality_correlation"]), 6),
+            "calibration_quality": quality,
         },
         model_package=package,
     )
@@ -1581,8 +1705,6 @@ async def ws_live(websocket: WebSocket) -> None:
         minimum=0,
         maximum=2_000_000_000,
     )
-    last_sample_timestamp = ""
-
     await websocket.send_json(
         {
             "type": "connected",
@@ -1620,8 +1742,6 @@ async def ws_live(websocket: WebSocket) -> None:
                         minimum=0,
                         maximum=2_000_000_000,
                     )
-                    last_sample_timestamp = ""
-
                 if payload.get("type") == "ping":
                     await websocket.send_json({"type": "pong", "server_timestamp": utc_iso_now()})
 
@@ -1648,11 +1768,7 @@ async def ws_live(websocket: WebSocket) -> None:
                 limit=500,
             )
             if samples:
-                candidate = samples[-1]
-                candidate_ts = str(candidate.get("timestamp") or "")
-                if candidate_ts and candidate_ts != last_sample_timestamp:
-                    latest_sample = candidate
-                    last_sample_timestamp = candidate_ts
+                latest_sample = samples[-1]
 
         status_payload = None
         try:

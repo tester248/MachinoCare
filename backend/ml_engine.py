@@ -6,6 +6,7 @@ from typing import Mapping, Sequence
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
+from sklearn.svm import OneClassSVM
 from sklearn.linear_model import Ridge
 
 FEATURE_ORDER = [
@@ -119,6 +120,52 @@ def train_isolation_forest_distilled(
         quality = 0.0
     else:
         quality = float(np.corrcoef(iso_scores, distilled_scores)[0, 1])
+
+    return {
+        "feature_means": feature_means.tolist(),
+        "feature_stds": feature_stds.tolist(),
+        "weights": distill.coef_.tolist(),
+        "bias": float(distill.intercept_),
+        "decision_threshold": high,
+        "hysteresis_high": high,
+        "hysteresis_low": low,
+        "quality_correlation": quality,
+        "window_count": int(feature_matrix.shape[0]),
+    }
+
+
+def train_oneclass_svm_distilled(
+    feature_matrix: np.ndarray,
+    contamination: float,
+) -> dict:
+    if feature_matrix.shape[0] < 8:
+        raise ValueError("Need at least 8 windows for calibration.")
+
+    feature_means = np.mean(feature_matrix, axis=0)
+    feature_stds = np.std(feature_matrix, axis=0)
+    feature_stds = np.where(feature_stds < 1e-6, 1.0, feature_stds)
+
+    normalized = (feature_matrix - feature_means) / feature_stds
+
+    ocsvm = OneClassSVM(
+        kernel="rbf",
+        nu=float(max(0.01, min(0.40, contamination))),
+        gamma="scale",
+    )
+    ocsvm.fit(normalized)
+    ocsvm_scores = -ocsvm.decision_function(normalized).reshape(-1)
+
+    distill = Ridge(alpha=1.0)
+    distill.fit(normalized, ocsvm_scores)
+    distilled_scores = distill.predict(normalized)
+
+    high = float(np.percentile(distilled_scores, 95))
+    low = float(np.percentile(distilled_scores, 90))
+
+    if np.std(ocsvm_scores) < 1e-8 or np.std(distilled_scores) < 1e-8:
+        quality = 0.0
+    else:
+        quality = float(np.corrcoef(ocsvm_scores, distilled_scores)[0, 1])
 
     return {
         "feature_means": feature_means.tolist(),

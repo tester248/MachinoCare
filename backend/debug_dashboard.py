@@ -357,6 +357,8 @@ def get_debug_dashboard_html() -> str:
     let lastTimestamp = '';
     let lastLogId = 0;
     let activeProfileKey = '';
+    let duplicateTimestampOffsetMs = 0;
+    let lastSampleSignature = '';
 
     function el(id) { return document.getElementById(id); }
 
@@ -556,9 +558,35 @@ def get_debug_dashboard_html() -> str:
       return Number.isFinite(num) ? num : null;
     }
 
+    function normalizeTimestampString(value) {
+      if (typeof value !== 'string') return value;
+      let text = value.trim();
+      if (!text) return text;
+
+      if (text.endsWith('+00:00')) {
+        text = text.slice(0, -6) + 'Z';
+      }
+
+      const parts = text.split('.');
+      if (parts.length === 2) {
+        const tail = parts[1];
+        const tzMatch = tail.match(/(Z|[+-]\d{2}:\d{2})$/);
+        const tz = tzMatch ? tzMatch[1] : '';
+        const frac = tz ? tail.slice(0, -tz.length) : tail;
+        const fracMillis = frac.slice(0, 3).padEnd(3, '0');
+        text = `${parts[0]}.${fracMillis}${tz}`;
+      }
+      return text;
+    }
+
     function parseTimestamp(value) {
-      if (!value) return null;
-      const parsed = new Date(value);
+      if (value == null || value === '') return null;
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        const millis = value < 1e12 ? value * 1000 : value;
+        const numericDate = new Date(millis);
+        return Number.isNaN(numericDate.valueOf()) ? null : numericDate;
+      }
+      const parsed = new Date(normalizeTimestampString(value));
       return Number.isNaN(parsed.valueOf()) ? null : parsed;
     }
 
@@ -568,16 +596,43 @@ def get_debug_dashboard_html() -> str:
         traces[key].length = 0;
       }
       lastTimestamp = null;
+      duplicateTimestampOffsetMs = 0;
+      lastSampleSignature = '';
+    }
+
+    function buildSampleSignature(sample, status) {
+      const current = status && status.current ? status.current : {};
+      return JSON.stringify({
+        timestamp: sample ? sample.timestamp : null,
+        sequence: sample ? sample.sequence ?? null : null,
+        acc_mag: sample ? sample.acc_mag ?? null : null,
+        gyro_mag: sample ? sample.gyro_mag ?? null : null,
+        gx: sample ? sample.gx ?? null : null,
+        gy: sample ? sample.gy ?? null : null,
+        gz: sample ? sample.gz ?? null : null,
+        sw420: sample ? sample.sw420 ?? null : null,
+        score: current.score ?? null,
+        decision_threshold: current.decision_threshold ?? null,
+      });
     }
 
     function appendSample(sample, status) {
       if (!sample || !sample.timestamp) return;
+      const signature = buildSampleSignature(sample, status);
+      if (signature === lastSampleSignature) return;
+      lastSampleSignature = signature;
       const timestamp = parseTimestamp(sample.timestamp);
       if (!timestamp) return;
       const stamp = timestamp.valueOf();
-      if (stamp === lastTimestamp) return;
+      let chartStamp = stamp;
+      if (stamp === lastTimestamp) {
+        duplicateTimestampOffsetMs += 1;
+        chartStamp = stamp + duplicateTimestampOffsetMs;
+      } else {
+        duplicateTimestampOffsetMs = 0;
+      }
       lastTimestamp = stamp;
-      timestamps.push(timestamp);
+      timestamps.push(new Date(chartStamp));
 
       const values = {
         acc_mag: toNumber(sample.acc_mag),
@@ -599,6 +654,39 @@ def get_debug_dashboard_html() -> str:
       if (timestamps.length > 600) timestamps.shift();
     }
 
+    async function loadRecentSamples(deviceName, lookbackSeconds) {
+      if (!deviceName) return;
+      try {
+        const seconds = Math.max(10, Number(lookbackSeconds || 120));
+        const response = await fetch(`/api/v1/stream/recent/${encodeURIComponent(deviceName)}?seconds=${seconds}&limit=600`);
+        if (!response.ok) return;
+        const payload = await response.json();
+        const samples = Array.isArray(payload.samples) ? payload.samples : [];
+        for (const sample of samples) {
+          appendSample(sample, null);
+        }
+        renderChart();
+      } catch (_) {
+        // Best-effort fallback only; websocket/status still drive live dashboard.
+      }
+    }
+
+    function fallbackSampleFromStatus(status) {
+      const current = status && status.current ? status.current : null;
+      if (!current) return null;
+      const ts = current.last_update;
+      if (!ts) return null;
+      return {
+        timestamp: ts,
+        acc_mag: current.acc_mag,
+        gyro_mag: current.gyro_mag,
+        gx: null,
+        gy: null,
+        gz: null,
+        sw420: null,
+      };
+    }
+
     function renderChartPanel(targetId, allowedKeys, yAxisTitle, emptyMessage) {
       const fields = selectedFields();
       const plotData = [];
@@ -609,8 +697,9 @@ def get_debug_dashboard_html() -> str:
           x: timestamps,
           y: traces[cfg.key] || [],
           name: cfg.label,
-          mode: 'lines',
-          line: { width: 2, color: cfg.color }
+          mode: 'lines+markers',
+          line: { width: 2, color: cfg.color },
+          marker: { size: 4, color: cfg.color }
         });
       }
 
@@ -833,7 +922,7 @@ def get_debug_dashboard_html() -> str:
       const target = el('llmReport');
       el('llmMeta').textContent = 'Loading insight...';
       try {
-        const response = await fetch(`/api/v1/insights/${encodeURIComponent(deviceName)}`);
+        const response = await fetch(`/api/v1/insights/${encodeURIComponent(deviceName)}?regenerate=true`);
         if (!response.ok) {
           const text = await response.text();
           target.textContent = `Insight unavailable: ${text}`;
@@ -876,6 +965,7 @@ def get_debug_dashboard_html() -> str:
         resetChartData();
         setConnState('connected', 'ok');
         ws.send(JSON.stringify(subscribeMessage(machine, device, lookback)));
+        loadRecentSamples(deviceName, lookback);
         loadInsights(deviceName);
       };
 
@@ -885,7 +975,8 @@ def get_debug_dashboard_html() -> str:
           updateBindingHint(packet.active_stream_binding || null);
         }
         if (packet.type === 'snapshot') {
-          if (packet.latest_sample) appendSample(packet.latest_sample, packet.status || null);
+          const liveSample = packet.latest_sample || fallbackSampleFromStatus(packet.status || null);
+          if (liveSample) appendSample(liveSample, packet.status || null);
           if (packet.status) updateStatus(packet.status);
           updateBindingHint(packet.active_stream_binding || null);
           mergeLogs(packet.new_logs || []);
