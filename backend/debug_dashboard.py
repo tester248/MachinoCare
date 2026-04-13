@@ -556,10 +556,28 @@ def get_debug_dashboard_html() -> str:
       return Number.isFinite(num) ? num : null;
     }
 
+    function parseTimestamp(value) {
+      if (!value) return null;
+      const parsed = new Date(value);
+      return Number.isNaN(parsed.valueOf()) ? null : parsed;
+    }
+
+    function resetChartData() {
+      timestamps.length = 0;
+      for (const key of Object.keys(traces)) {
+        traces[key].length = 0;
+      }
+      lastTimestamp = null;
+    }
+
     function appendSample(sample, status) {
-      if (!sample || !sample.timestamp || sample.timestamp === lastTimestamp) return;
-      lastTimestamp = sample.timestamp;
-      timestamps.push(sample.timestamp);
+      if (!sample || !sample.timestamp) return;
+      const timestamp = parseTimestamp(sample.timestamp);
+      if (!timestamp) return;
+      const stamp = timestamp.valueOf();
+      if (stamp === lastTimestamp) return;
+      lastTimestamp = stamp;
+      timestamps.push(timestamp);
 
       const values = {
         acc_mag: toNumber(sample.acc_mag),
@@ -672,7 +690,8 @@ def get_debug_dashboard_html() -> str:
       const source = String(llm.source || 'n/a');
       const model = String(llm.model || 'n/a');
       const generated = String(llm.generated_at || 'n/a');
-      el('llmMeta').textContent = `Source: ${source} | Model: ${model} | Generated: ${generated}`;
+      const error = String(llm.error || '');
+      el('llmMeta').textContent = `Source: ${source} | Model: ${model} | Generated: ${generated}` + (error ? ` | Error: ${error}` : '');
     }
 
     function renderLogs() {
@@ -854,6 +873,7 @@ def get_debug_dashboard_html() -> str:
       ws = new WebSocket(toWsUrl(deviceName, lookback));
 
       ws.onopen = () => {
+        resetChartData();
         setConnState('connected', 'ok');
         ws.send(JSON.stringify(subscribeMessage(machine, device, lookback)));
         loadInsights(deviceName);
@@ -901,8 +921,6 @@ def get_debug_dashboard_html() -> str:
       setProfileSwitching(false);
     }
 
-    async function saveProfile() {
-      const profile = currentProfile();
       if (!profile) {
         el('profileHint').textContent = 'Select a profile before saving.';
         return;

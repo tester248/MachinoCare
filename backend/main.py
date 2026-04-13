@@ -44,6 +44,15 @@ from backend.storage import DataStore
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT_DIR / ".env")
+load_dotenv()
+
+
+def _get_env_var(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
 
 DB_PATH = os.getenv("MACHINOCARE_DB", "data/machinocare.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -54,9 +63,13 @@ DEBUG_MAX_BODY_BYTES = int(os.getenv("MACHINOCARE_DEBUG_MAX_BODY_BYTES", "20000"
 LIVE_PUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("MACHINOCARE_LIVE_PUSH_INTERVAL_SECONDS", "0.75")))
 UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
 UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
-GROQ_MODEL = os.getenv("MACHINOCARE_GROQ_MODEL", "meta-llama/llama-prompt-guard-2-86m").strip()
-GROQ_API_URL = os.getenv("MACHINOCARE_GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
+GROQ_API_KEY = _get_env_var("GROQ_API_KEY", "MACHINOCARE_GROQ_API_KEY")
+GROQ_MODEL = _get_env_var("MACHINOCARE_GROQ_MODEL", "GROQ_MODEL", default="meta-llama/llama-prompt-guard-2-86m")
+GROQ_API_URL = _get_env_var(
+    "MACHINOCARE_GROQ_API_URL",
+    "GROQ_API_URL",
+    default="https://api.groq.com/openai/v1/chat/completions",
+)
 GROQ_TIMEOUT_SECONDS = max(5, int(float(os.getenv("MACHINOCARE_GROQ_TIMEOUT_SECONDS", "20"))))
 INSIGHT_MAX_REPORT_CHARS = max(200, int(os.getenv("MACHINOCARE_INSIGHT_MAX_REPORT_CHARS", "1000")))
 
