@@ -467,7 +467,7 @@ with st.sidebar:
         st.warning("No active association. Incoming stream routes to unassigned target.")
 
     association_col, clear_col = st.columns(2)
-    if association_col.button("Associate stream", use_container_width=True, disabled=selected_profile is None):
+    if association_col.button("Associate stream", width="stretch", disabled=selected_profile is None):
         bind_data, bind_error = request_json(
             f"{api_base}/api/v1/stream-binding",
             method="POST",
@@ -482,7 +482,7 @@ with st.sidebar:
             _ = bind_data
             st.success(f"Incoming stream now targets {selected_profile_label}")
 
-    if clear_col.button("Clear association", use_container_width=True):
+    if clear_col.button("Clear association", width="stretch"):
         _, clear_error = request_json(
             f"{api_base}/api/v1/stream-binding?source=streamlit_dashboard",
             method="DELETE",
@@ -546,7 +546,7 @@ with st.sidebar:
     )
     st.text_area("Profile notes", key="form_notes")
 
-    if st.button("Save selected profile", use_container_width=True, disabled=selected_profile is None):
+    if st.button("Save selected profile", width="stretch", disabled=selected_profile is None):
         save_data, save_error = request_json(
             f"{api_base}/api/v1/device-profiles",
             method="POST",
@@ -570,7 +570,7 @@ with st.sidebar:
             st.rerun()
 
     new_profile_display_name = st.text_input("Create profile (display name)", key="new_profile_display_name")
-    if st.button("Create profile", use_container_width=True):
+    if st.button("Create profile", width="stretch"):
         create_name = new_profile_display_name.strip()
         if not create_name:
             st.error("Enter a display name to create a profile.")
@@ -615,7 +615,7 @@ with st.sidebar:
     use_profile_defaults = st.toggle("Use saved profile settings", value=True)
     new_device_setup = st.toggle("New device setup", value=True)
 
-    if st.button("Start calibration training", use_container_width=True):
+    if st.button("Start calibration training", width="stretch"):
         if selected_profile is None:
             st.error("Create and select a profile before starting calibration.")
             start_data = None
@@ -666,7 +666,7 @@ with st.sidebar:
 
     st.subheader("Profile Lifecycle")
     confirm_profile_delete = st.toggle("Confirm profile delete", value=False)
-    if st.button("Delete selected profile", use_container_width=True, disabled=selected_profile is None):
+    if st.button("Delete selected profile", width="stretch", disabled=selected_profile is None):
         if not confirm_profile_delete:
             st.error("Enable profile delete confirmation before removing a profile.")
         else:
@@ -845,7 +845,7 @@ def render_live_ui() -> None:
                 legend={"orientation": "h", "y": 1.1, "x": 0},
             )
             if fig_primary.data:
-                st.plotly_chart(fig_primary, use_container_width=True)
+                st.plotly_chart(fig_primary, width="stretch")
             else:
                 st.info("Select at least one primary field to display the first live chart.")
 
@@ -888,7 +888,7 @@ def render_live_ui() -> None:
                 legend={"orientation": "h", "y": 1.1, "x": 0},
             )
             if fig_axes.data:
-                st.plotly_chart(fig_axes, use_container_width=True)
+                st.plotly_chart(fig_axes, width="stretch")
             else:
                 st.info("Select at least one axis field to display the second live chart.")
 
@@ -897,7 +897,7 @@ def render_live_ui() -> None:
                 st.subheader("Latest Sample - All Values")
                 latest_t = latest.T
                 latest_t.columns = ["value"]
-                st.dataframe(latest_t, use_container_width=True, height=420)
+                st.dataframe(latest_t, width="stretch", height=420)
 
     with right:
         health_score = None
@@ -947,7 +947,7 @@ def render_live_ui() -> None:
             if st.button(
                 "Regenerate LLM report",
                 key=f"regen_report_{selected_machine}_{selected_device}",
-                use_container_width=True,
+                width="stretch",
             ):
                 with st.spinner("Regenerating report..."):
                     regenerated, regen_error = request_json(
@@ -1027,7 +1027,7 @@ def render_live_ui() -> None:
                 }
                 for item in logs
             ]
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=280)
+            st.dataframe(pd.DataFrame(summary_rows), width="stretch", height=280)
             with st.expander("Latest API log payload details", expanded=False):
                 st.json(logs[:20])
 
@@ -1100,7 +1100,7 @@ if use_thingspeak:
             hovermode="x unified",
         )
         if hist_fig.data:
-            st.plotly_chart(hist_fig, use_container_width=True)
+            st.plotly_chart(hist_fig, width="stretch")
         else:
             st.info("Select at least one ThingSpeak field to display history.")
 
