@@ -224,15 +224,20 @@ st.markdown(
 )
 
 
-def request_json(url: str, method: str = "GET", payload: dict | None = None) -> tuple[dict | None, str | None]:
+def request_json(
+    url: str,
+    method: str = "GET",
+    payload: dict | None = None,
+    timeout: float = 5,
+) -> tuple[dict | None, str | None]:
     try:
         method = method.upper()
         if method == "POST":
-            response = requests.post(url, json=payload, timeout=5)
+            response = requests.post(url, json=payload, timeout=timeout)
         elif method == "DELETE":
-            response = requests.delete(url, timeout=5)
+            response = requests.delete(url, timeout=timeout)
         else:
-            response = requests.get(url, timeout=5)
+            response = requests.get(url, timeout=timeout)
         response.raise_for_status()
         return response.json(), None
     except Exception as exc:  # noqa: BLE001
@@ -267,6 +272,18 @@ def thingspeak_history(channel_id: str, results: int = 60) -> tuple[pd.DataFrame
 def status_badge(is_anomaly: bool, status_label: str) -> str:
     css_class = "mc-anomaly" if is_anomaly else "mc-healthy"
     return f"<span class='mc-status {css_class}'>{status_label}</span>"
+
+
+def health_score_color(score: float | None) -> str:
+    if score is None:
+        return "#475569"
+    if score >= 85:
+        return "#1b8a5a"
+    if score >= 70:
+        return "#0f766e"
+    if score >= 50:
+        return "#b45309"
+    return "#b91c1c"
 
 
 def normalize_recent_samples(samples: list[dict]) -> pd.DataFrame:
@@ -667,6 +684,10 @@ def render_live_ui() -> None:
             st.session_state.active_job_id = None
 
     status_data, status_error = request_json(f"{api_base}/api/v1/status/{selected_machine}/{selected_device}")
+    insight_data, insight_error = request_json(
+        f"{api_base}/api/v1/insights/{selected_machine}/{selected_device}",
+        timeout=15,
+    )
     recent_data, recent_error = request_json(
         f"{api_base}/api/v1/stream/{selected_machine}/recent?seconds={lookback_seconds}&limit=5000&device_id={selected_device}"
     )
@@ -847,6 +868,69 @@ def render_live_ui() -> None:
                 st.dataframe(latest_t, use_container_width=True, height=420)
 
     with right:
+        health_score = None
+        health_band = "Unknown"
+        llm_report = None
+        llm_meta: dict = {}
+        if insight_data:
+            try:
+                raw_score = insight_data.get("health_score_percent")
+                health_score = float(raw_score) if raw_score is not None else None
+            except (TypeError, ValueError):
+                health_score = None
+            health_band = str(insight_data.get("health_band") or "Unknown")
+            llm_report = insight_data.get("llm_report")
+            llm_meta = insight_data.get("llm") if isinstance(insight_data.get("llm"), dict) else {}
+
+        health_value = f"{health_score:.1f}%" if health_score is not None else "n/a"
+        health_color = health_score_color(health_score)
+        st.markdown(
+            (
+                "<div class='mc-glass'>"
+                "<div class='mc-title'>Smart Machine Health Score</div>"
+                f"<div class='mc-value' style='font-size:2.2rem; color:{health_color} !important;'>{health_value}</div>"
+                f"<div style='margin-top:0.35rem; font-size:0.95rem;'>Band: {health_band}</div>"
+                "</div>"
+            ),
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("LLM device health report", expanded=False):
+            if insight_error:
+                st.warning(f"Insight report unavailable: {insight_error}")
+            else:
+                st.write(llm_report or "No report generated yet.")
+                generated_at = llm_meta.get("generated_at")
+                source = llm_meta.get("source")
+                model_name = llm_meta.get("model")
+                if generated_at or source or model_name:
+                    st.caption(
+                        (
+                            f"Generated: {generated_at or 'n/a'} | "
+                            f"Source: {source or 'n/a'} | "
+                            f"Model: {model_name or 'n/a'}"
+                        )
+                    )
+
+            if st.button(
+                "Regenerate LLM report",
+                key=f"regen_report_{selected_machine}_{selected_device}",
+                use_container_width=True,
+            ):
+                with st.spinner("Regenerating report..."):
+                    regenerated, regen_error = request_json(
+                        f"{api_base}/api/v1/insights/{selected_machine}/{selected_device}/regenerate",
+                        method="POST",
+                        timeout=30,
+                    )
+                if regen_error:
+                    st.error(f"Failed to regenerate report: {regen_error}")
+                else:
+                    insight_data = regenerated or insight_data
+                    st.success("LLM report regenerated.")
+
+        st.markdown("<div style='height: 0.8rem;'></div>", unsafe_allow_html=True)
+
         st.markdown(
             (
                 "<div class='mc-glass'>"
@@ -887,6 +971,9 @@ def render_live_ui() -> None:
 
     with st.expander("Backend Payload - Full Status JSON", expanded=False):
         st.json(status_data)
+
+    with st.expander("Backend Payload - Full Insight JSON", expanded=False):
+        st.json(insight_data or {"error": insight_error or "n/a"})
 
     st.subheader("Live API Logs (ESP/backend)")
     if debug_logs_error:

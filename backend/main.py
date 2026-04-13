@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import requests
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -47,6 +48,11 @@ DEBUG_MAX_BODY_BYTES = int(os.getenv("MACHINOCARE_DEBUG_MAX_BODY_BYTES", "20000"
 LIVE_PUSH_INTERVAL_SECONDS = max(0.2, float(os.getenv("MACHINOCARE_LIVE_PUSH_INTERVAL_SECONDS", "0.75")))
 UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
 UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.getenv("MACHINOCARE_GROQ_MODEL", "meta-llama/llama-prompt-guard-2-86m").strip()
+GROQ_API_URL = os.getenv("MACHINOCARE_GROQ_API_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
+GROQ_TIMEOUT_SECONDS = max(5, int(float(os.getenv("MACHINOCARE_GROQ_TIMEOUT_SECONDS", "20"))))
+INSIGHT_MAX_REPORT_CHARS = max(200, int(os.getenv("MACHINOCARE_INSIGHT_MAX_REPORT_CHARS", "1000")))
 
 store = DataStore(db_path=DB_PATH, max_buffer_size=BUFFER_SIZE, database_url=DATABASE_URL)
 
@@ -70,6 +76,8 @@ router = APIRouter()
 
 calibration_jobs: dict[str, dict[str, Any]] = {}
 calibration_jobs_lock = threading.Lock()
+insight_cache: dict[str, dict[str, Any]] = {}
+insight_cache_lock = threading.Lock()
 last_debug_purge_monotonic = 0.0
 
 
@@ -255,6 +263,247 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _insight_cache_key(machine_id: str, device_id: str) -> str:
+    return f"{machine_id}::{device_id}"
+
+
+def _health_band(score: float) -> str:
+    if score >= 85:
+        return "Excellent"
+    if score >= 70:
+        return "Good"
+    if score >= 50:
+        return "Watchlist"
+    return "Critical"
+
+
+def _compute_health_snapshot(status_payload: dict[str, Any], anomaly_count_24h: int) -> dict[str, Any]:
+    current = status_payload.get("current") or {}
+
+    score = _safe_float(current.get("score"))
+    threshold = _safe_float(current.get("decision_threshold"))
+    consecutive_windows = max(0, int(current.get("consecutive_windows") or 0))
+    is_anomaly = bool(status_payload.get("is_anomaly"))
+
+    if score is not None and threshold is not None and threshold > 0:
+        score_ratio = score / threshold
+        score_penalty = 0.0
+        if score_ratio > 0.60:
+            score_penalty = min(45.0, (score_ratio - 0.60) * 35.0)
+    else:
+        score_ratio = None
+        score_penalty = 10.0 if is_anomaly else 4.0
+
+    consecutive_penalty = min(20.0, consecutive_windows * 4.0)
+    anomaly_penalty = min(20.0, max(0, anomaly_count_24h) * 2.0)
+    active_alert_penalty = 15.0 if is_anomaly else 0.0
+
+    health_score = 100.0 - score_penalty - consecutive_penalty - anomaly_penalty - active_alert_penalty
+    health_score = max(0.0, min(100.0, health_score))
+    health_score = round(health_score, 2)
+
+    return {
+        "health_score_percent": health_score,
+        "health_band": _health_band(health_score),
+        "score_ratio": round(score_ratio, 6) if score_ratio is not None else None,
+        "components": {
+            "score_penalty": round(score_penalty, 2),
+            "consecutive_penalty": round(consecutive_penalty, 2),
+            "anomaly_history_penalty": round(anomaly_penalty, 2),
+            "active_alert_penalty": round(active_alert_penalty, 2),
+            "anomaly_count_24h": int(max(0, anomaly_count_24h)),
+            "consecutive_windows": consecutive_windows,
+        },
+    }
+
+
+def _build_report_prompt(
+    machine_id: str,
+    device_id: str,
+    status_payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> str:
+    current = status_payload.get("current") or {}
+    calibration = status_payload.get("calibration") or {}
+    model_summary = status_payload.get("model_summary") or {}
+
+    return (
+        "You are a predictive maintenance analyst for rotating machines. "
+        "Write a short health report in plain text.\n"
+        "Output format requirements:\n"
+        "- Maximum 90 words.\n"
+        "- 2 to 4 bullet points.\n"
+        "- End with one action sentence.\n"
+        "- No markdown heading.\n\n"
+        f"Machine ID: {machine_id}\n"
+        f"Device ID: {device_id}\n"
+        f"Health score (%): {snapshot.get('health_score_percent')}\n"
+        f"Health band: {snapshot.get('health_band')}\n"
+        f"Current anomaly flag: {status_payload.get('is_anomaly')}\n"
+        f"Status label: {status_payload.get('status_label')}\n"
+        f"Current anomaly score: {current.get('score')}\n"
+        f"Decision threshold: {current.get('decision_threshold')}\n"
+        f"Consecutive anomaly windows: {current.get('consecutive_windows')}\n"
+        f"Anomaly events (24h): {(snapshot.get('components') or {}).get('anomaly_count_24h')}\n"
+        f"Last update timestamp: {current.get('last_update')}\n"
+        f"Calibration stage: {calibration.get('stage')}\n"
+        f"Calibration progress: {calibration.get('progress')}\n"
+        f"Model type: {model_summary.get('model_type')}\n"
+        f"Model quality correlation: {model_summary.get('quality_correlation')}\n"
+    )
+
+
+def _truncate_report(text: str) -> str:
+    if len(text) <= INSIGHT_MAX_REPORT_CHARS:
+        return text
+    return text[:INSIGHT_MAX_REPORT_CHARS].rstrip() + "..."
+
+
+def _generate_report_with_groq(
+    machine_id: str,
+    device_id: str,
+    status_payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> str:
+    if not GROQ_API_KEY:
+        raise RuntimeError("GROQ_API_KEY is not configured")
+
+    payload = {
+        "model": GROQ_MODEL,
+        "temperature": 0.2,
+        "max_tokens": 220,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You produce concise machine-health reports from telemetry.",
+            },
+            {
+                "role": "user",
+                "content": _build_report_prompt(
+                    machine_id=machine_id,
+                    device_id=device_id,
+                    status_payload=status_payload,
+                    snapshot=snapshot,
+                ),
+            },
+        ],
+    }
+
+    response = requests.post(
+        GROQ_API_URL,
+        headers={
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=GROQ_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+
+    body = response.json()
+    choices = body.get("choices") or []
+    message = ((choices[0] if choices else {}).get("message") or {}).get("content")
+    text = str(message or "").strip()
+    if not text:
+        raise RuntimeError("Groq response did not include report content")
+    return _truncate_report(text)
+
+
+def _fallback_report(snapshot: dict[str, Any], status_payload: dict[str, Any]) -> str:
+    current = status_payload.get("current") or {}
+    score = snapshot.get("health_score_percent")
+    band = snapshot.get("health_band")
+    anomaly_count = (snapshot.get("components") or {}).get("anomaly_count_24h", 0)
+    consecutive = (snapshot.get("components") or {}).get("consecutive_windows", 0)
+    anomaly_flag = bool(status_payload.get("is_anomaly"))
+
+    if anomaly_flag:
+        action = "Investigate vibration source and inspect motor/fan mount before next cycle."
+    elif band in {"Watchlist", "Critical"}:
+        action = "Schedule preventive inspection and recalibrate model with fresh baseline data."
+    else:
+        action = "Continue monitoring and keep calibration schedule unchanged."
+
+    return (
+        f"- Health score is {score}% ({band}).\n"
+        f"- Current anomaly score is {current.get('score')} with threshold {current.get('decision_threshold')}.\n"
+        f"- Last 24h anomalies: {anomaly_count}; consecutive anomaly windows: {consecutive}.\n"
+        f"{action}"
+    )
+
+
+def _build_machine_insight(machine_id: str, device_id: str, *, force_regenerate: bool) -> dict[str, Any]:
+    status_payload = get_status_for_device(machine_id, device_id)
+    anomaly_count_24h = len(store.get_anomalies(machine_id, device_id=device_id, hours=24, limit=200))
+    snapshot = _compute_health_snapshot(status_payload, anomaly_count_24h)
+
+    cache_key = _insight_cache_key(machine_id, device_id)
+    with insight_cache_lock:
+        cached = dict(insight_cache.get(cache_key, {}))
+
+    llm_report = str(cached.get("llm_report") or "").strip()
+    llm_meta = dict(cached.get("llm") or {})
+
+    should_generate = force_regenerate or not llm_report
+    if should_generate:
+        generated_at = utc_iso_now()
+        report_source = "groq"
+        report_error = None
+
+        try:
+            llm_report = _generate_report_with_groq(machine_id, device_id, status_payload, snapshot)
+        except Exception as exc:  # noqa: BLE001
+            llm_report = _fallback_report(snapshot, status_payload)
+            report_source = "fallback"
+            report_error = str(exc)
+
+        llm_meta = {
+            "provider": "groq",
+            "model": GROQ_MODEL,
+            "source": report_source,
+            "generated_at": generated_at,
+            "cached": False,
+            "api_key_configured": bool(GROQ_API_KEY),
+            "error": report_error,
+        }
+        with insight_cache_lock:
+            insight_cache[cache_key] = {
+                "llm_report": llm_report,
+                "llm": llm_meta,
+            }
+    else:
+        llm_meta.setdefault("provider", "groq")
+        llm_meta.setdefault("model", GROQ_MODEL)
+        llm_meta.setdefault("source", "cache")
+        llm_meta.setdefault("generated_at", None)
+        llm_meta["cached"] = True
+        llm_meta.setdefault("api_key_configured", bool(GROQ_API_KEY))
+        llm_meta.setdefault("error", None)
+
+    return {
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "server_timestamp": utc_iso_now(),
+        "status_label": status_payload.get("status_label"),
+        "is_anomaly": bool(status_payload.get("is_anomaly")),
+        "health_score_percent": snapshot["health_score_percent"],
+        "health_band": snapshot["health_band"],
+        "health_components": snapshot["components"],
+        "score_ratio": snapshot.get("score_ratio"),
+        "llm_report": llm_report,
+        "llm": llm_meta,
+    }
 
 
 def get_active_stream_binding() -> dict[str, Any] | None:
@@ -915,6 +1164,44 @@ def get_status(machine_id: str) -> dict[str, Any]:
     if not latest_device:
         raise HTTPException(status_code=404, detail=f"Machine '{machine_id}' has no data yet.")
     return get_status_for_device(machine_id, latest_device)
+
+
+@router.get("/insights/{machine_id}/{device_id}")
+def machine_insights(
+    machine_id: str,
+    device_id: str,
+    regenerate: bool = Query(default=False),
+) -> dict[str, Any]:
+    return _build_machine_insight(machine_id, device_id, force_regenerate=bool(regenerate))
+
+
+@router.post("/insights/{machine_id}/{device_id}/regenerate")
+def regenerate_machine_insights(machine_id: str, device_id: str) -> dict[str, Any]:
+    return _build_machine_insight(machine_id, device_id, force_regenerate=True)
+
+
+@router.get("/blynk/insights/{machine_id}/{device_id}")
+def blynk_insights(machine_id: str, device_id: str) -> dict[str, Any]:
+    insight = _build_machine_insight(machine_id, device_id, force_regenerate=False)
+    return {
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "server_timestamp": insight.get("server_timestamp"),
+        "status_label": insight.get("status_label"),
+        "is_anomaly": insight.get("is_anomaly"),
+        "health_score_percent": insight.get("health_score_percent"),
+        "llm_report": insight.get("llm_report"),
+        "report_generated_at": (insight.get("llm") or {}).get("generated_at"),
+        "report_source": (insight.get("llm") or {}).get("source"),
+    }
+
+
+@router.get("/blynk/insights/{machine_id}")
+def blynk_insights_latest_device(machine_id: str) -> dict[str, Any]:
+    latest_device = store.latest_device_for_machine(machine_id)
+    if not latest_device:
+        raise HTTPException(status_code=404, detail=f"Machine '{machine_id}' has no data yet.")
+    return blynk_insights(machine_id, latest_device)
 
 
 @router.get("/stream/{machine_id}/recent")
