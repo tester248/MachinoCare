@@ -25,6 +25,7 @@ It combines:
 - [API Reference](#api-reference)
 - [Dashboard Guide](#dashboard-guide)
 - [Firmware Integration](#firmware-integration)
+- [Blynk Config Automation](#blynk-config-automation)
 - [Deployment (Railway)](#deployment-railway)
 - [Development and Validation](#development-and-validation)
 - [Troubleshooting](#troubleshooting)
@@ -79,7 +80,7 @@ flowchart LR
     API --> STORE[(SQLite / PostgreSQL)]
     API -->|WS /api/v1/ws/live| DBG[Realtime Debug Dashboard]
     API -->|REST| ST[Streamlit Dashboard]
-    API -->|GET /api/v1/model/{machine}/{device}| ESP
+    API -->|GET /api/v1/model/:machine/:device| ESP
     ESP --> TS[ThingSpeak Channel]
     ST -->|ThingSpeak Read API| TS
     DBG -->|ThingSpeak Read API| TS
@@ -302,20 +303,44 @@ Before flashing, replace placeholders:
 - `TS_WRITE_KEY`
 - `BACKEND_BASE_URL`
 
-Static firmware IDs (used in payload compatibility fields):
-- `MACHINE_ID` (default `Fan_1`)
-- `DEVICE_ID` (default `esp32_fan_1`)
+Firmware no longer depends on hardcoded `MACHINE_ID`/`DEVICE_ID` constants for stream upload.
+Incoming routing is profile-driven using backend stream binding.
 
 Pin mapping (current):
 - `SW420_PIN = 34`
 - `RELAY_MOTOR_PIN = 25`
 - `RELAY_FAN_PIN = 26`
-- `BTN_MOTOR_PIN = 18`
-- `BTN_FAN_PIN = 19`
-- `BTN_CALIB_PIN = 23`
+- `LED_PIN = 27`
+- `BUZZER_PIN = 33`
+
+Blynk relay/output control mapping (current):
+- `V14` -> motor relay
+- `V15` -> fan relay
+- `V20` -> buzzer
+- `V21` -> LED manual override
 
 Blynk setup details:
 - `docs/BLYNK_FINAL_DEMO_SETUP.md`
+
+## Blynk Config Automation
+
+Yes, you can automate part of Blynk configuration import/generation.
+
+What you can automate reliably:
+- Template/device provisioning via Blynk HTTP API
+- Datastream creation and updates from a JSON/CSV spec
+- Device creation from a prepared template
+
+What is usually not fully one-click importable:
+- Complete visual dashboard/widget layout placement in a single portable config file
+
+Recommended workflow:
+1. Build one master template manually (widgets + datastream design).
+2. Keep datastream definitions in repo as machine-readable config.
+3. Use a small script to sync datastream definitions to Blynk via API.
+4. Clone/reuse the template for new devices/environments.
+
+This gives repeatability without recreating everything by hand each time.
 
 ## Deployment (Railway)
 
