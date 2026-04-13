@@ -1,12 +1,13 @@
 // ============================================================
-// MachinoCare - Final Firmware (MERGED)
-// AI + Failsafe + Cloud + Backend + 2 Relays + 3 Buttons
-// + Stream telemetry + remote relay control + debug prints
+// MachinoCare - FINAL COMBINED (NO SECRETS)
+// AI + Failsafe + Cloud + Backend + ThingSpeak + Blynk Relay Control
+// (No physical buttons)
 // ============================================================
 
-#define BLYNK_TEMPLATE_ID   "TMPL3LJfoU1on"
-#define BLYNK_TEMPLATE_NAME "Machinocare"
-#define BLYNK_AUTH_TOKEN    "REPLACE_WITH_BLYNK_AUTH_TOKEN"
+// -------------------- BLYNK CREDENTIALS --------------------
+#define BLYNK_TEMPLATE_ID   "YOUR_BLYNK_TEMPLATE_ID"
+#define BLYNK_TEMPLATE_NAME "YOUR_BLYNK_TEMPLATE_NAME"
+#define BLYNK_AUTH_TOKEN    "YOUR_BLYNK_AUTH_TOKEN"
 
 #include <Wire.h>
 #include <MPU6050.h>
@@ -20,16 +21,17 @@
 #include "time.h"
 
 // WiFi and cloud credentials
-const char* ssid     = "REPLACE_WITH_WIFI_SSID";
-const char* password = "REPLACE_WITH_WIFI_PASSWORD";
-unsigned long TS_CHANNEL_ID = 3336916;
-const char* TS_WRITE_KEY = "REPLACE_WITH_THINGSPEAK_WRITE_KEY";
+const char* ssid     = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+unsigned long TS_CHANNEL_ID = 0; // e.g. 1234567
+const char* TS_WRITE_KEY = "YOUR_THINGSPEAK_WRITE_KEY";
 WiFiClient tsClient;
 
 // Backend settings
-const char* BACKEND_BASE_URL = "https://REPLACE_WITH_BACKEND_DOMAIN";
-const char* MACHINE_ID = "Fan_1";
-const char* DEVICE_ID = "esp32_fan_1";
+const char* BACKEND_BASE_URL = "https://YOUR_BACKEND_URL";
+const char* MACHINE_ID = "YOUR_MACHINE_ID";
+const char* DEVICE_ID = "YOUR_DEVICE_ID";
 bool backendEnabled = true;
 
 // NTP settings
@@ -37,19 +39,16 @@ const char* ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 19800;
 const int daylightOffset_sec = 0;
 
-// Hardware pins (your current mapping)
+// Hardware pins
 const int SW420_PIN = 34;
-const int RELAY_MOTOR_PIN = 25;
-const int RELAY_FAN_PIN   = 26;
-const int BTN_MOTOR_PIN   = 18;
-const int BTN_FAN_PIN     = 19;
-const int BTN_CALIB_PIN   = 23;
+const int RELAY_MOTOR_PIN = 25; // IN1
+const int RELAY_FAN_PIN   = 26; // IN2
 
-// Relay polarity (active LOW board)
+// Relay polarity (most 2-ch modules are active LOW)
 const int RELAY_ON  = LOW;
 const int RELAY_OFF = HIGH;
 
-// true = no relay cut (safe debugging), false = hard failsafe
+// true = don't hard-cut relays on SW420 trigger, false = production kill
 volatile bool debugMode = true;
 
 MPU6050 mpu;
@@ -61,11 +60,13 @@ float accMag = 0;
 float gyroMag = 0;
 int gx = 0, gy = 0, gz = 0;
 
+// Fallback threshold
 float aiThreshold = 25000.0;
+
 volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
 
-// Relay states
+// Relay state
 bool motorOn = true;
 bool fanOn   = true;
 
@@ -74,10 +75,10 @@ float accSum = 0;
 float accPeak = 0;
 int sampleCount = 0;
 
-// Lightweight edge model
+// Distilled model
 const int FEATURE_DIM = 8;
 float featureMeans[FEATURE_DIM] = {0};
-float featureStds[FEATURE_DIM] = {1, 1, 1, 1, 1, 1, 1, 1};
+float featureStds[FEATURE_DIM] = {1,1,1,1,1,1,1,1};
 float modelWeights[FEATURE_DIM] = {0};
 float modelBias = 0.0;
 float modelDecisionThreshold = 0.55;
@@ -89,7 +90,7 @@ String modelChecksum = "";
 bool modelReady = false;
 int anomalyStreak = 0;
 
-// Calibration tracking
+// Calibration job tracking
 String calibrationJobId = "";
 bool calibrationInProgress = false;
 int calibrationProgress = 0;
@@ -104,19 +105,7 @@ unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
 
-// Debounced buttons
-const unsigned long BUTTON_DEBOUNCE_MS = 40;
-int motorBtnRawLast = HIGH;
-int fanBtnRawLast = HIGH;
-int calibBtnRawLast = HIGH;
-int motorBtnStable = HIGH;
-int fanBtnStable = HIGH;
-int calibBtnStable = HIGH;
-unsigned long motorBtnLastChangeMs = 0;
-unsigned long fanBtnLastChangeMs = 0;
-unsigned long calibBtnLastChangeMs = 0;
-
-// 1 second feature window (100ms ticks)
+// Feature window
 const int WINDOW_SIZE = 10;
 float accWindow[WINDOW_SIZE] = {0};
 float gyroWindow[WINDOW_SIZE] = {0};
@@ -128,6 +117,8 @@ int windowCount = 0;
 
 const int STREAM_HTTP_TIMEOUT_MS = 1400;
 const int MODEL_HTTP_TIMEOUT_MS = 2500;
+
+// -------------------- Helpers --------------------
 
 void applyRelays() {
   digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
@@ -172,9 +163,9 @@ void IRAM_ATTR emergencyKillSwitch() {
 String getTimeString() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return "Time_Error";
-  char timeStringBuff[20];
-  strftime(timeStringBuff, sizeof(timeStringBuff), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  return String(timeStringBuff);
+  char buff[20];
+  strftime(buff, sizeof(buff), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  return String(buff);
 }
 
 void pushWindowSample(float aMag, float gMag, float x, float y, float z) {
@@ -302,6 +293,7 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
   http.setConnectTimeout(timeoutMs);
   http.setTimeout(timeoutMs);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("Accept", "application/json");
 
   int code = http.POST(payload);
   if (statusCodeOut) *statusCodeOut = code;
@@ -335,6 +327,8 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
   http.end();
   return (code >= 200 && code < 300);
 }
+
+// -------------------- Model persistence --------------------
 
 void saveModelToNvs() {
   prefs.begin("machinocare", false);
@@ -411,6 +405,8 @@ bool applyModelPackage(JsonObject pkg) {
   saveModelToNvs();
   return true;
 }
+
+// -------------------- Backend calibration --------------------
 
 void pushCalibrationToBlynk() {
   Blynk.virtualWrite(V10, calibrationStage + " | " + calibrationMessage);
@@ -534,6 +530,8 @@ void requestCalibrationFromBackend() {
   startCalibrationJobOnBackend(false, "scheduled_timer");
 }
 
+// -------------------- Stream + cloud --------------------
+
 void sendStreamToBackend() {
   if (!backendEnabled) return;
   if (emergencyTriggered && !debugMode) return;
@@ -559,6 +557,7 @@ void sendStreamToBackend() {
   String response;
   String url = String(BACKEND_BASE_URL) + "/api/v1/stream";
   int httpCode = 0;
+
   if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
     streamFailCount++;
     lastStreamHttpCode = httpCode;
@@ -570,6 +569,8 @@ void sendStreamToBackend() {
     Serial.print(httpCode);
     Serial.print(",wifi=");
     Serial.println(WiFi.status());
+    Serial.print("STREAM_FAIL_BODY=");
+    Serial.println(response);
     return;
   }
 
@@ -592,98 +593,53 @@ void sendStreamToBackend() {
   }
 }
 
-// Blynk button V8: start training as new device configuration
+void reportBackendTelemetry() {
+  Serial.print("STREAM_STATS,attempt=");
+  Serial.print(streamAttemptCount);
+  Serial.print(",success=");
+  Serial.print(streamSuccessCount);
+  Serial.print(",fail=");
+  Serial.print(streamFailCount);
+  Serial.print(",lastCode=");
+  Serial.print(lastStreamHttpCode);
+  Serial.print(",lastResult=");
+  Serial.println(lastStreamResult);
+}
+
+// -------------------- Blynk handlers --------------------
+
+// V8: calibration trigger
 BLYNK_WRITE(V8) {
   int trigger = param.asInt();
   if (trigger == 1) {
+    resetRuntimeForFreshCalibration();
     startCalibrationJobOnBackend(calibrationAsNewDevice, "blynk_button");
     Blynk.virtualWrite(V8, 0);
   }
 }
 
-// Blynk switch V13: choose whether button means new-device setup
+// V13: new-device calibration mode
 BLYNK_WRITE(V13) {
   calibrationAsNewDevice = (param.asInt() == 1);
 }
 
-// Blynk switch V14: motor relay remote control
+// V14: motor relay
 BLYNK_WRITE(V14) {
   motorOn = (param.asInt() == 1);
   applyRelays();
+  Serial.print("BLYNK_MOTOR,");
+  Serial.println(motorOn ? "ON" : "OFF");
 }
 
-// Blynk switch V15: fan relay remote control
+// V15: fan relay
 BLYNK_WRITE(V15) {
   fanOn = (param.asInt() == 1);
   applyRelays();
+  Serial.print("BLYNK_FAN,");
+  Serial.println(fanOn ? "ON" : "OFF");
 }
 
-void debugCalibButtonRaw() {
-  static unsigned long last = 0;
-  if (millis() - last >= 300) {
-    last = millis();
-    Serial.print("RAW CALIB BTN = ");
-    Serial.println(digitalRead(BTN_CALIB_PIN)); // 1 idle, 0 pressed
-  }
-}
-
-// Debounced physical button handler
-void handlePhysicalButtons() {
-  if (emergencyTriggered && !debugMode) return;
-
-  unsigned long nowMs = millis();
-
-  int mRaw = digitalRead(BTN_MOTOR_PIN);
-  if (mRaw != motorBtnRawLast) {
-    motorBtnRawLast = mRaw;
-    motorBtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - motorBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && mRaw != motorBtnStable) {
-    motorBtnStable = mRaw;
-    if (motorBtnStable == LOW) {
-      motorOn = !motorOn;
-      applyRelays();
-      Serial.print("BTN_MOTOR,");
-      Serial.println(motorOn ? "ON" : "OFF");
-    }
-  }
-
-  int fRaw = digitalRead(BTN_FAN_PIN);
-  if (fRaw != fanBtnRawLast) {
-    fanBtnRawLast = fRaw;
-    fanBtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - fanBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && fRaw != fanBtnStable) {
-    fanBtnStable = fRaw;
-    if (fanBtnStable == LOW) {
-      fanOn = !fanOn;
-      applyRelays();
-      Serial.print("BTN_FAN,");
-      Serial.println(fanOn ? "ON" : "OFF");
-    }
-  }
-
-  int cRaw = digitalRead(BTN_CALIB_PIN);
-  if (cRaw != calibBtnRawLast) {
-    calibBtnRawLast = cRaw;
-    calibBtnLastChangeMs = nowMs;
-  }
-  if ((nowMs - calibBtnLastChangeMs) > BUTTON_DEBOUNCE_MS && cRaw != calibBtnStable) {
-    calibBtnStable = cRaw;
-    if (calibBtnStable == LOW) {
-      Serial.println("================================================");
-      Serial.println("CALIB BUTTON PRESSED");
-      Serial.print("Time: ");
-      Serial.println(getTimeString());
-      Serial.println("Action: Reset runtime + start new-device calibration");
-      Serial.println("================================================");
-
-      resetRuntimeForFreshCalibration();
-      bool started = startCalibrationJobOnBackend(calibrationAsNewDevice, "physical_button");
-      Serial.println(started ? "BTN_CALIB,STARTED" : "BTN_CALIB,FAILED");
-    }
-  }
-}
+// -------------------- Main tasks --------------------
 
 void readSensorsAndPredict() {
   int16_t raw_ax, raw_ay, raw_az, raw_gx, raw_gy, raw_gz;
@@ -709,6 +665,7 @@ void readSensorsAndPredict() {
     Blynk.logEvent("machine_alert", "AI anomaly detected by local edge inference");
   }
 
+  // Serial output restored (for plotting/IA pipeline)
   Serial.print(accMag);      Serial.print(",");
   Serial.print(gyroMag);     Serial.print(",");
   Serial.print(gx);          Serial.print(",");
@@ -731,30 +688,15 @@ void updateBlynk() {
   Blynk.virtualWrite(V6, getTimeString());
   Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
 
-  // relay states
   Blynk.virtualWrite(V14, motorOn ? 1 : 0);
   Blynk.virtualWrite(V15, fanOn ? 1 : 0);
 
-  // backend stream telemetry
   Blynk.virtualWrite(V16, (int)streamSuccessCount);
   Blynk.virtualWrite(V17, (int)streamFailCount);
   Blynk.virtualWrite(V18, lastStreamHttpCode);
   Blynk.virtualWrite(V19, lastStreamResult);
 
   pushCalibrationToBlynk();
-}
-
-void reportBackendTelemetry() {
-  Serial.print("STREAM_STATS,attempt=");
-  Serial.print(streamAttemptCount);
-  Serial.print(",success=");
-  Serial.print(streamSuccessCount);
-  Serial.print(",fail=");
-  Serial.print(streamFailCount);
-  Serial.print(",lastCode=");
-  Serial.print(lastStreamHttpCode);
-  Serial.print(",lastResult=");
-  Serial.println(lastStreamResult);
 }
 
 void updateThingSpeak() {
@@ -784,36 +726,44 @@ void updateThingSpeak() {
   }
 }
 
+// -------------------- setup/loop --------------------
+
 void setup() {
   Serial.begin(115200);
+  delay(1000);
+  Serial.println("S1: boot");
+
   Wire.begin(21, 22);
+  Serial.println("S2: wire");
   mpu.initialize();
+  Serial.println("S3: mpu");
 
   pinMode(SW420_PIN, INPUT);
   pinMode(RELAY_MOTOR_PIN, OUTPUT);
   pinMode(RELAY_FAN_PIN, OUTPUT);
 
-  pinMode(BTN_MOTOR_PIN, INPUT_PULLUP);
-  pinMode(BTN_FAN_PIN, INPUT_PULLUP);
-  pinMode(BTN_CALIB_PIN, INPUT_PULLUP);
-
   motorOn = true;
   fanOn = true;
   applyRelays();
+  Serial.println("S4: pins");
 
   attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, RISING);
+  Serial.println("S5: interrupt");
 
-  if (debugMode) Serial.println("DEBUG MODE ON: relay kill disabled");
-  else Serial.println("PRODUCTION MODE: relay kill armed");
+  // Non-blocking WiFi + Blynk
+  WiFi.begin(ssid, password);
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Serial.println("S6: wifi+blynk config");
 
-  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
   ThingSpeak.begin(tsClient);
   configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+  Serial.println("S7: cloud init");
 
   loadModelFromNvs();
   updateCalibrationRuntime("idle", 0, "Ready", false);
+  Serial.println("S8: model loaded");
 
-  timer.setInterval(50L, handlePhysicalButtons);
+  // Full timers restored
   timer.setInterval(100L, readSensorsAndPredict);
   timer.setInterval(1000L, updateBlynk);
   timer.setInterval(1000L, sendStreamToBackend);
@@ -824,6 +774,8 @@ void setup() {
   timer.setInterval(300000L, pullModelPackageFromBackend);      // 5 min
   timer.setInterval(1800000L, requestCalibrationFromBackend);   // 30 min
   timer.setInterval(2000L, pollCalibrationJobStatus);           // 2 sec
+
+  Serial.println("S9: setup complete");
 }
 
 void loop() {
@@ -837,16 +789,25 @@ void loop() {
       Serial.println("EMERGENCY SHUTDOWN: system locked");
       Blynk.virtualWrite(V5, 1);
 
-      while (true) {
-        delay(1000);
-      }
+      while (true) delay(1000);
     } else {
       Serial.println("DEBUG WARNING: SW-420 trigger detected (shutdown bypassed)");
       emergencyTriggered = false;
     }
   }
 
-  debugCalibButtonRaw();
-  Blynk.run();
+  if (WiFi.status() == WL_CONNECTED) {
+    Blynk.run();
+  }
+
   timer.run();
+
+  static unsigned long t = 0;
+  if (millis() - t > 3000) {
+    t = millis();
+    Serial.print("HB wifi=");
+    Serial.print(WiFi.status());
+    Serial.print(" blynk=");
+    Serial.println(Blynk.connected() ? "1" : "0");
+  }
 }
