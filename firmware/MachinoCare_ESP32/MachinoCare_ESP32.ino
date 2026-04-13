@@ -2,6 +2,7 @@
 // MachinoCare - FINAL COMBINED (NO SECRETS)
 // AI + Failsafe + Cloud + Backend + ThingSpeak + Blynk Relay/LED/Buzzer Control
 // (No physical buttons)
+// LED normal ON, anomaly => LED OFF + buzzer pulse for 5s
 // ============================================================
 
 // -------------------- BLYNK CREDENTIALS --------------------
@@ -69,10 +70,11 @@ int gx = 0, gy = 0, gz = 0;
 
 // Fallback threshold
 float aiThreshold = 25000.0;
+const float AI_THRESHOLD_SCALE = 1.0;
+const int AI_MIN_CONSECUTIVE = 3;
 
 volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
-bool systemLedOn = true;
 bool sw420FaultLatched = false;
 bool sw420DebugCooldownActive = false;
 bool sw420FaultAnnounced = false;
@@ -93,6 +95,12 @@ bool motorOn = true;
 bool fanOn = true;
 bool buzzerManualOn = false;
 bool ledManualOn = false;
+
+// Anomaly alert behavior: LED OFF + buzzer pulse for 5s
+bool anomalyAlertActive = false;
+unsigned long anomalyAlertStartMs = 0;
+const unsigned long ANOMALY_ALERT_DURATION_MS = 5000;
+const unsigned long ANOMALY_BUZZER_PULSE_MS = 220;
 
 // ThingSpeak window stats
 float accSum = 0;
@@ -157,23 +165,37 @@ void applyIndicators() {
 }
 
 void updateAlertOutputs() {
-  if (sw420DebugCooldownActive && debugMode && millis() >= sw420DebugCooldownUntilMs) {
+  unsigned long now = millis();
+
+  if (sw420DebugCooldownActive && debugMode && now >= sw420DebugCooldownUntilMs) {
     sw420DebugCooldownActive = false;
-    systemLedOn = true;
     sw420FaultAnnounced = false;
   }
 
-  bool sw420Muted = sw420DebugCooldownActive && debugMode && millis() < sw420DebugCooldownUntilMs;
-  bool alertActive = isMachineFailing;
-  bool ledState = (systemLedOn || ledManualOn) && !sw420FaultLatched && !sw420Muted;
-  bool buzzerState = buzzerManualOn && !sw420FaultLatched && !sw420Muted;
-
-  if (alertActive) {
-    // Pulse buzzer on alerts so it is noticeable without being continuously harsh.
-    buzzerState = ((millis() / 220) % 2) == 0;
+  if (anomalyAlertActive && (now - anomalyAlertStartMs >= ANOMALY_ALERT_DURATION_MS)) {
+    anomalyAlertActive = false;
   }
 
-  if (sw420FaultLatched) {
+  bool sw420Muted = sw420DebugCooldownActive && debugMode && now < sw420DebugCooldownUntilMs;
+
+  // Normal state: LED ON, buzzer OFF
+  bool ledState = true;
+  bool buzzerState = false;
+
+  // Anomaly state: LED OFF + buzzer pulse
+  if (anomalyAlertActive) {
+    ledState = false;
+    buzzerState = ((now / ANOMALY_BUZZER_PULSE_MS) % 2) == 0;
+  }
+
+  // Manual controls only when no anomaly and no SW420 block
+  if (!anomalyAlertActive && !sw420FaultLatched && !sw420Muted) {
+    ledState = ledState || ledManualOn;
+    buzzerState = buzzerManualOn;
+  }
+
+  // SW420 safety highest priority
+  if (sw420FaultLatched || sw420Muted) {
     ledState = false;
     buzzerState = false;
     if (!debugMode) {
@@ -391,17 +413,17 @@ float scoreDistilledModel(float features[FEATURE_DIM]) {
 }
 
 bool evaluateLocalAI() {
-  if (!modelReady) return accMag > aiThreshold;
+  if (!modelReady) return accMag > (aiThreshold * AI_THRESHOLD_SCALE);
 
   float features[FEATURE_DIM] = {0};
-  if (!computeFeatureVector(features)) return accMag > aiThreshold;
+  if (!computeFeatureVector(features)) return accMag > (aiThreshold * AI_THRESHOLD_SCALE);
 
   float score = scoreDistilledModel(features);
 
   if (score >= modelHysteresisHigh) anomalyStreak++;
   else if (score < modelHysteresisLow) anomalyStreak = 0;
 
-  bool anomaly = anomalyStreak >= modelMinConsecutiveWindows;
+  bool anomaly = anomalyStreak >= AI_MIN_CONSECUTIVE;
 
   Serial.print("MODEL,");
   Serial.print(score); Serial.print(",");
@@ -948,6 +970,8 @@ void readSensorsAndPredict() {
   isMachineFailing = evaluateLocalAI();
 
   if (isMachineFailing && !wasFailing) {
+    anomalyAlertActive = true;
+    anomalyAlertStartMs = millis();
     Blynk.logEvent("machine_alert", "AI anomaly detected by local edge inference");
   }
 
@@ -1035,7 +1059,6 @@ void setup() {
   fanOn = true;
   buzzerManualOn = false;
   ledManualOn = false;
-  systemLedOn = true;
   applyIndicators();
   Serial.println("S4: pins");
 
@@ -1113,7 +1136,6 @@ void loop() {
     fanOn = false;
     buzzerManualOn = false;
     ledManualOn = false;
-    systemLedOn = false;
 
     updateAlertOutputs();
 
@@ -1143,6 +1165,10 @@ void loop() {
     Serial.print("HB wifi=");
     Serial.print(WiFi.status());
     Serial.print(" blynk=");
-    Serial.println(Blynk.connected() ? "1" : "0");
+    Serial.print(Blynk.connected() ? "1" : "0");
+    Serial.print(" acc=");
+    Serial.print(accMag);
+    Serial.print(" fail=");
+    Serial.println(isMachineFailing ? "1" : "0");
   }
 }
