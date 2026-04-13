@@ -206,8 +206,16 @@ def get_debug_dashboard_html() -> str:
           <div class="m"><div class="k">Acc</div><div class="v" id="accVal">n/a</div></div>
           <div class="m"><div class="k">Score</div><div class="v" id="scoreVal">n/a</div></div>
           <div class="m"><div class="k">Threshold</div><div class="v" id="thrVal">n/a</div></div>
+          <div class="m"><div class="k">Health</div><div class="v" id="healthScore">n/a</div></div>
+          <div class="m"><div class="k">Band</div><div class="v" id="healthBand">n/a</div></div>
           <div class="m"><div class="k">Calibration</div><div class="v" id="calibVal">idle</div></div>
         </div>
+      </section>
+
+      <section class="card status">
+        <h3 style="margin:0 0 0.5rem;">LLM Insight</h3>
+        <div id="llmReport" style="min-height:100px; white-space:pre-wrap; color:#10263a; margin-bottom:0.75rem;">No report loaded.</div>
+        <div class="hint" id="llmMeta">Source: n/a | Model: n/a | Generated: n/a</div>
       </section>
 
       <section class="card chart">
@@ -646,6 +654,27 @@ def get_debug_dashboard_html() -> str:
       el('calibVal').textContent = `${stage} (${progress}%) | model ${espVersion}/${backendVersion} ${syncState}`;
     }
 
+    function updateInsight(insight) {
+      if (!insight) {
+        el('healthScore').textContent = 'n/a';
+        el('healthBand').textContent = 'n/a';
+        el('llmReport').textContent = 'No report loaded.';
+        el('llmMeta').textContent = 'Source: n/a | Model: n/a | Generated: n/a';
+        return;
+      }
+
+      const healthScore = insight.health_score_percent;
+      el('healthScore').textContent = healthScore != null ? `${Number(healthScore).toFixed(1)}%` : 'n/a';
+      el('healthBand').textContent = String(insight.health_band || 'n/a');
+      el('llmReport').textContent = String(insight.llm_report || 'No report generated yet.');
+
+      const llm = insight.llm || {};
+      const source = String(llm.source || 'n/a');
+      const model = String(llm.model || 'n/a');
+      const generated = String(llm.generated_at || 'n/a');
+      el('llmMeta').textContent = `Source: ${source} | Model: ${model} | Generated: ${generated}`;
+    }
+
     function renderLogs() {
       const body = el('logsBody');
       body.innerHTML = '';
@@ -781,6 +810,29 @@ def get_debug_dashboard_html() -> str:
       setProfileSwitching(false);
     }
 
+    async function loadInsights(deviceName) {
+      const target = el('llmReport');
+      el('llmMeta').textContent = 'Loading insight...';
+      try {
+        const response = await fetch(`/api/v1/insights/${encodeURIComponent(deviceName)}`);
+        if (!response.ok) {
+          const text = await response.text();
+          target.textContent = `Insight unavailable: ${text}`;
+          el('healthScore').textContent = 'n/a';
+          el('healthBand').textContent = 'n/a';
+          el('llmMeta').textContent = 'Source: n/a | Model: n/a | Generated: n/a';
+          return;
+        }
+        const insight = await response.json();
+        updateInsight(insight);
+      } catch (err) {
+        target.textContent = `Insight fetch failed: ${err.message || err}`;
+        el('healthScore').textContent = 'n/a';
+        el('healthBand').textContent = 'n/a';
+        el('llmMeta').textContent = 'Source: n/a | Model: n/a | Generated: n/a';
+      }
+    }
+
     function connectLive() {
       const profile = currentProfile();
       if (!profile) {
@@ -804,6 +856,7 @@ def get_debug_dashboard_html() -> str:
       ws.onopen = () => {
         setConnState('connected', 'ok');
         ws.send(JSON.stringify(subscribeMessage(machine, device, lookback)));
+        loadInsights(deviceName);
       };
 
       ws.onmessage = (evt) => {
@@ -839,6 +892,11 @@ def get_debug_dashboard_html() -> str:
       activeProfileKey = key;
       applyProfileToForm(currentProfile());
       await refreshBinding();
+      const profile = currentProfile();
+      if (profile) {
+        const deviceName = String(profile.display_name || '').trim();
+        loadInsights(deviceName);
+      }
       if (ws) connectLive();
       setProfileSwitching(false);
     }
@@ -1050,6 +1108,10 @@ def get_debug_dashboard_html() -> str:
           activeProfileKey = key;
           el('profileSelect').value = key;
           applyProfileToForm(currentProfile());
+          const profile = currentProfile();
+          if (profile) {
+            loadInsights(String(profile.display_name || '').trim());
+          }
         }
       }
 
