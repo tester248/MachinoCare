@@ -1,58 +1,161 @@
 # MachinoCare
 
-MachinoCare is an end-to-end predictive maintenance system for vibration-based machine monitoring.
+[![Deploy on Railway](https://railway.app/button.svg)](https://railway.app/new/template?template=https://github.com/tester248/MachinoCare)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.115%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-1.44%2B-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![PostgreSQL](https://img.shields.io/badge/Database-SQLite%20%7C%20PostgreSQL-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
+
+MachinoCare is an end-to-end predictive maintenance platform for vibration monitoring.
 
 It combines:
-- ESP32 edge firmware (MPU6050 + SW420 + relays + buttons)
-- FastAPI backend for streaming, calibration, and model management
-- Streamlit dashboard (fallback) + FastAPI realtime debug dashboard
+- ESP32 firmware (MPU6050 + SW420 + relays + buttons)
+- FastAPI backend (stream ingest, calibration, model serving, debug telemetry)
+- Streamlit operator dashboard
+- FastAPI-hosted realtime debug dashboard (`/debug-dashboard`)
 
-## What This Repository Contains
+## Table of Contents
 
-- `backend/` FastAPI service and ML pipeline
-- `dashboard/` Streamlit live control room
+- [What This Repo Contains](#what-this-repo-contains)
+- [Core Concepts](#core-concepts)
+- [Architecture Diagrams](#architecture-diagrams)
+- [Feature Summary](#feature-summary)
+- [Quick Start (Local)](#quick-start-local)
+- [Configuration](#configuration)
+- [API Reference](#api-reference)
+- [Dashboard Guide](#dashboard-guide)
+- [Firmware Integration](#firmware-integration)
+- [Deployment (Railway)](#deployment-railway)
+- [Development and Validation](#development-and-validation)
+- [Troubleshooting](#troubleshooting)
+- [Safety Note](#safety-note)
+
+## What This Repo Contains
+
+- `backend/` FastAPI service, calibration pipeline, persistence, debug logs, websocket feed
+- `dashboard/` Streamlit control room
 - `firmware/MachinoCare_ESP32/` ESP32 firmware
-- `docs/` supporting documentation (including Blynk setup)
-- `run_all.py` helper to start backend + dashboard together
-- `Procfile` deploy entrypoint (runs `run_all.py`)
+- `docs/` supplementary setup docs (including Blynk)
+- `scripts/railway_setup_postgres.sh` Railway DB/bootstrap automation
+- `run_all.py` launcher for backend + Streamlit side-by-side
+- `Procfile` process entrypoint (`web: python run_all.py`)
+- `railway.toml` Railway build/start/healthcheck config
 
-## System Overview
+## Core Concepts
 
-1. ESP32 samples vibration data and publishes stream packets to the backend.
-2. Backend stores recent samples (ring buffer + SQLite), computes status, and serves APIs.
-3. Calibration jobs train an Isolation Forest-based model and produce a distilled edge package.
-4. ESP32 pulls model package updates and performs local inference with hysteresis.
-5. Dashboard visualizes live state, calibration progress, and recent/historical telemetry.
+### 1) Profile-first operation
 
-## Key Features
+Profiles represent target machines/devices with calibration defaults. Both dashboards are profile-centric:
+- Select profile by display name
+- Create/update/delete profiles
+- Associate incoming stream to selected profile
+
+### 2) Stream binding controls ingest routing
+
+`POST /api/v1/stream` accepts ESP IDs for compatibility, but backend routing is determined by active stream binding:
+- If binding is active: samples route to bound profile machine/device
+- If no binding: samples route to unassigned target
+    - `MACHINOCARE_UNASSIGNED_MACHINE_ID` (default: `unassigned_machine`)
+    - `MACHINOCARE_UNASSIGNED_DEVICE_ID` (default: `unassigned_device`)
+
+### 3) Hybrid realtime visibility
+
+- Streamlit dashboard: operator-centric controls + live metrics + live API logs + ThingSpeak history
+- FastAPI debug dashboard: no-flicker websocket feed + payload inspector + ThingSpeak history
+
+### 4) Storage mode
+
+Auto-detected backend:
+- PostgreSQL if `DATABASE_URL` is set
+- Otherwise SQLite (`MACHINOCARE_DB`, default `data/machinocare.db`)
+
+## Architecture Diagrams
+
+### End-to-end system flow
+
+```mermaid
+flowchart LR
+    ESP[ESP32 Firmware\nMPU6050 + SW420 + Relays] -->|POST /api/v1/stream| API[FastAPI Backend]
+    API --> STORE[(SQLite / PostgreSQL)]
+    API -->|WS /api/v1/ws/live| DBG[Realtime Debug Dashboard]
+    API -->|REST| ST[Streamlit Dashboard]
+    API -->|GET /api/v1/model/{machine}/{device}| ESP
+    ESP --> TS[ThingSpeak Channel]
+    ST -->|ThingSpeak Read API| TS
+    DBG -->|ThingSpeak Read API| TS
+```
+
+### Stream ingest routing and anomaly status
+
+```mermaid
+flowchart TD
+    A[Incoming Stream Payload] --> B{Active Stream Binding?}
+    B -- Yes --> C[Route sample to bound profile machine/device]
+    B -- No --> D[Route sample to unassigned target]
+    C --> E[Persist sample + update in-memory buffer]
+    D --> E
+    E --> F{Model package available?}
+    F -- Yes --> G[Score feature vector + hysteresis]
+    F -- No --> H[Fallback threshold logic if available]
+    G --> I[Update machine/device state]
+    H --> I
+    I --> J[Expose status + logs via REST/WS]
+```
+
+### Calibration job lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> collecting_data
+    collecting_data --> extracting_features
+    extracting_features --> training_model
+    training_model --> completed
+    training_model --> failed
+    collecting_data --> failed
+    extracting_features --> failed
+```
+
+## Feature Summary
 
 ### Backend
-- Real-time ingest endpoint for single or batched stream payloads
-- Synchronous calibration (`/api/v1/calibrate`) and async calibration jobs (`/api/v1/calibrate/start`)
-- Device-specific status and model package endpoints
-- Recent stream retrieval, anomaly logs, machine/device discovery
-- Realtime WebSocket debug feed (`/api/v1/ws/live`)
-- SQLite or PostgreSQL persistence (`DATABASE_URL` auto-detected)
+
+- Real-time stream ingest (`sample` and batch `samples`)
+- Synchronous and asynchronous calibration
+- Device-specific model packaging and retrieval
+- Status and anomaly logging
+- API request/response debug log capture with retention policy
+- WebSocket live snapshots (status + latest sample + new debug logs)
+- Profile CRUD and stream-binding APIs
+
+### Streamlit dashboard
+
+- Profile-first workflow (display-name dropdown)
+- Create/update/delete profiles
+- Stream association controls
+- Live chart field toggles with human-readable names
+- ThingSpeak field toggles with channel-defined field names
+- Live API log table + payload inspector
+- Pulsing live indicator for refresh heartbeat
+
+### FastAPI debug dashboard (`/debug-dashboard`)
+
+- WebSocket-first live charting and status
+- Realtime API logs table + payload viewer
+- Profile management and stream association controls
+- ThingSpeak history with selectable fields
 
 ### Firmware (ESP32)
-- 2-relay control (motor + fan)
-- 3 physical buttons (motor toggle, fan toggle, calibration trigger)
-- SW420 interrupt-based emergency behavior
-- Blynk and ThingSpeak integration
-- Backend stream telemetry counters (success/fail/last HTTP code/result)
-- Model package persistence in NVS (`Preferences`)
 
-### Dashboard
-- Fragment-based live auto-refresh (smooth partial rerender)
-- Live plots for `acc_mag`, `gyro_mag`, `score`, `gx`, `gy`, `gz`, and `sw420`
-- Calibration control and progress monitoring
-- Full backend payload inspectors for troubleshooting
-- ThingSpeak multi-field historical chart
-- New backend-served realtime debug dashboard (`/debug-dashboard`) with no Streamlit rerender greying
+- Motor/fan relays and physical button controls
+- SW420 emergency behavior path
+- Blynk telemetry/control integration
+- ThingSpeak publishing
+- Backend stream and model pull support
 
 ## Quick Start (Local)
 
-### 1. Create and activate a virtual environment
+### 1. Create and activate environment
 
 ```bash
 python -m venv .venv
@@ -65,9 +168,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Run backend and dashboard
+### 3. Run services
 
-Option A: run separately
+Option A (separate):
 
 ```bash
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
@@ -77,7 +180,7 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 streamlit run dashboard/app.py --server.port 8501
 ```
 
-Option B: run together
+Option B (together):
 
 ```bash
 python run_all.py
@@ -85,116 +188,125 @@ python run_all.py
 
 ### 4. Open interfaces
 
-- Backend docs: `http://localhost:8000/docs`
-- Dashboard: `http://localhost:8501`
-- Realtime debug dashboard: `http://localhost:8000/debug-dashboard`
-- Health: `http://localhost:8000/api/v1/health`
+- FastAPI docs: `http://localhost:8000/docs`
+- FastAPI health: `http://localhost:8000/api/v1/health`
+- FastAPI debug dashboard: `http://localhost:8000/debug-dashboard`
+- Streamlit dashboard: `http://localhost:8501`
 
-## API Surface (Current)
+## Configuration
 
-### Health and root
+### Backend environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MACHINOCARE_DB` | `data/machinocare.db` | SQLite file path when not using PostgreSQL |
+| `DATABASE_URL` | unset | Enables PostgreSQL mode |
+| `MACHINOCARE_BUFFER_SIZE` | `12000` | In-memory sample buffer size |
+| `MACHINOCARE_DEBUG_SAMPLE_RATE` | `0.10` | Debug payload sampling ratio |
+| `MACHINOCARE_DEBUG_RETENTION_DAYS` | `30` | Debug log retention window |
+| `MACHINOCARE_DEBUG_MAX_BODY_BYTES` | `20000` | Max captured request/response body bytes |
+| `MACHINOCARE_LIVE_PUSH_INTERVAL_SECONDS` | `0.75` | WebSocket live snapshot cadence |
+| `MACHINOCARE_UNASSIGNED_MACHINE_ID` | `unassigned_machine` | Fallback routing machine ID when unbound |
+| `MACHINOCARE_UNASSIGNED_DEVICE_ID` | `unassigned_device` | Fallback routing device ID when unbound |
+
+### Launcher variables (`run_all.py`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PORT` / `BACKEND_PORT` | `8000` | FastAPI port (`PORT` preferred for Railway) |
+| `DASHBOARD_PORT` | `8501` | Streamlit port |
+| `BACKEND_HOST` | `0.0.0.0` | FastAPI bind host |
+| `DASHBOARD_HOST` | `0.0.0.0` | Streamlit bind host |
+| `ENABLE_RELOAD` | `0` | Adds `--reload` to uvicorn when `1` |
+
+### Streamlit variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `MACHINOCARE_API_URL` | `http://localhost:8000` | Backend base URL for dashboard calls |
+| `MACHINOCARE_THINGSPEAK_CHANNEL` | `3336916` | Default ThingSpeak channel in UI |
+
+## API Reference
+
+Base prefix: `/api/v1`
+
+### Platform
+
+- `GET /health`
 - `GET /` redirects to `/docs`
-- `GET /api/v1/health`
 
 ### Streaming and status
-- `POST /api/v1/stream`
-- `GET /api/v1/stream/{machine_id}/recent`
-- `GET /api/v1/status/{machine_id}`
-- `GET /api/v1/status/{machine_id}/{device_id}`
-- `GET /api/v1/anomaly-log/{machine_id}`
 
-`POST /api/v1/stream` now routes incoming samples to the active dashboard-selected stream binding. ESP payload `machine_id` and `device_id` are accepted for compatibility and logged, but ignored for routing.
+- `POST /stream`
+- `GET /stream/{machine_id}/recent`
+- `GET /status/{machine_id}`
+- `GET /status/{machine_id}/{device_id}`
+- `GET /anomaly-log/{machine_id}`
 
 ### Calibration and model
-- `POST /api/v1/calibrate`
-- `POST /api/v1/calibrate/start`
-- `POST /api/v1/calibrate/start/profile/{machine_id}/{device_id}`
-- `GET /api/v1/calibrate/status/{job_id}`
-- `GET /api/v1/model/{machine_id}`
-- `GET /api/v1/model/{machine_id}/{device_id}`
 
-### Discovery
-- `GET /api/v1/machines`
-- `GET /api/v1/devices/{machine_id}`
+- `POST /calibrate`
+- `POST /calibrate/start`
+- `POST /calibrate/start/profile/{machine_id}/{device_id}`
+- `GET /calibrate/status/{job_id}`
+- `GET /model/{machine_id}`
+- `GET /model/{machine_id}/{device_id}`
 
-### Debug and profiles
-- `POST /api/v1/device-profiles`
-- `GET /api/v1/device-profiles`
-- `GET /api/v1/device-profiles/{machine_id}/{device_id}`
-- `DELETE /api/v1/device-profiles/{machine_id}/{device_id}`
-- `GET /api/v1/stream-binding`
-- `POST /api/v1/stream-binding`
-- `DELETE /api/v1/stream-binding`
-- `GET /api/v1/debug/logs`
-- `WS /api/v1/ws/live`
+### Discovery and profile routing
 
-These endpoints are additive and do not require ESP32 firmware changes.
+- `GET /machines`
+- `GET /devices/{machine_id}`
+- `GET /device-profiles`
+- `POST /device-profiles`
+- `GET /device-profiles/{machine_id}/{device_id}`
+- `DELETE /device-profiles/{machine_id}/{device_id}`
+- `GET /stream-binding`
+- `POST /stream-binding`
+- `DELETE /stream-binding`
 
-## Example Requests
+### Debug
 
-### Stream ingest
+- `GET /debug/logs`
+- `WS /ws/live`
 
-```bash
-curl -X POST http://localhost:8000/api/v1/stream \
-    -H "Content-Type: application/json" \
-    -d '{
-        "machine_id":"Fan_1",
-        "device_id":"esp32_fan_1",
-        "sample":{
-            "timestamp":"2026-04-12T12:00:00Z",
-            "accMag":16000,
-            "gyroMag":1000,
-            "gx":10,
-            "gy":12,
-            "gz":8,
-            "sw420":0
-        }
-    }'
-```
+## Dashboard Guide
 
-### Start async calibration
+### Streamlit dashboard (`dashboard/app.py`)
 
-```bash
-curl -X POST http://localhost:8000/api/v1/calibrate/start \
-    -H "Content-Type: application/json" \
-    -d '{
-        "machine_id":"Fan_1",
-        "device_id":"esp32_fan_1",
-        "sample_rate_hz":10,
-        "window_seconds":1,
-        "fallback_seconds":300,
-        "contamination":0.05,
-        "min_consecutive_windows":3,
-        "new_device_setup":true,
-        "trigger_source":"dashboard_ui"
-    }'
-```
+Use Streamlit for day-to-day operator workflow:
+- Pick profile by display name
+- Create/update/delete profiles
+- Associate or clear incoming stream target
+- Start calibration with profile defaults or manual overrides
+- Toggle live chart fields
+- Toggle ThingSpeak fields by label
+- Review live API logs and payload snippets
 
-### Associate incoming stream to a profile
+### FastAPI debug dashboard (`/debug-dashboard`)
 
-```bash
-curl -X POST http://localhost:8000/api/v1/stream-binding \
-    -H "Content-Type: application/json" \
-    -d '{
-        "machine_id":"Fan_1",
-        "device_id":"esp32_fan_1",
-        "source":"dashboard_manual"
-    }'
-```
+Use debug dashboard for deeper runtime diagnostics:
+- WebSocket status and sample stream
+- Live API logs with payload inspector
+- Profile controls and stream binding
+- ThingSpeak history and field toggles
 
-## Firmware Setup
+## Firmware Integration
 
-Firmware file:
+Firmware source:
 - `firmware/MachinoCare_ESP32/MachinoCare_ESP32.ino`
 
-Before flashing, set these placeholders in the firmware:
+Before flashing, replace placeholders:
 - `BLYNK_AUTH_TOKEN`
 - `ssid`
 - `password`
 - `TS_WRITE_KEY`
 - `BACKEND_BASE_URL`
 
-Current hardware pin mapping in firmware:
+Static firmware IDs (used in payload compatibility fields):
+- `MACHINE_ID` (default `Fan_1`)
+- `DEVICE_ID` (default `esp32_fan_1`)
+
+Pin mapping (current):
 - `SW420_PIN = 34`
 - `RELAY_MOTOR_PIN = 25`
 - `RELAY_FAN_PIN = 26`
@@ -202,59 +314,89 @@ Current hardware pin mapping in firmware:
 - `BTN_FAN_PIN = 19`
 - `BTN_CALIB_PIN = 23`
 
-Blynk virtual pin usage (current):
-- `V0..V7` live sensor and status signals
-- `V8` start calibration
-- `V9` model version
-- `V10..V12` calibration stage/progress/active
-- `V13` new-device setup mode
-- `V14`, `V15` relay controls/state
-- `V16..V19` stream telemetry (success/fail/http/result)
-
-Detailed Blynk setup:
+Blynk setup details:
 - `docs/BLYNK_FINAL_DEMO_SETUP.md`
 
-## Deployment Notes
+## Deployment (Railway)
 
-This repo includes:
-- `Procfile` (`web: python run_all.py`)
-- `railway.toml` (automatic Railway build/start/healthcheck config)
+### Included deployment files
 
-For Railway (or similar platforms):
-1. Deploy from GitHub repository.
-2. Railway reads `railway.toml` on push and starts with `python run_all.py`.
-3. `run_all.py` starts FastAPI on Railway's `PORT` and Streamlit on `DASHBOARD_PORT` (default `8501`) in parallel.
-4. If using Railway proxying for dashboard, route proxy traffic to `DASHBOARD_PORT`.
-5. Add a Railway PostgreSQL service and set `DATABASE_URL` for managed DB persistence (auto-used by backend).
-6. Set persistent SQLite path only if not using PostgreSQL:
-     - `MACHINOCARE_DB=/data/machinocare.db`
-7. Verify after deploy:
+- `railway.toml`
+    - start command: `python run_all.py`
+    - healthcheck: `/api/v1/health`
+- `Procfile`
+    - `web: python run_all.py`
+
+### Recommended production pattern
+
+1. Connect repository to Railway
+2. Add PostgreSQL service
+3. Wire `DATABASE_URL` to backend service
+4. Deploy and verify:
      - `/api/v1/health`
      - `/docs`
-    - `/debug-dashboard`
+     - `/debug-dashboard`
 
-Railway CLI bootstrap (automated):
+### Railway CLI bootstrap helper
 
 ```bash
 railway login
-RAILWAY_PROJECT_ID=<project-id> RAILWAY_BACKEND_SERVICE=<backend-service-name> ./scripts/railway_setup_postgres.sh
+RAILWAY_PROJECT_ID=<project-id> \
+RAILWAY_BACKEND_SERVICE=<backend-service-name> \
+./scripts/railway_setup_postgres.sh
 railway up
 ```
 
-The script creates or reuses a PostgreSQL service, wires `DATABASE_URL` into your backend service, and sets debug dashboard runtime variables.
+Optional helper vars:
+- `RAILWAY_ENVIRONMENT`
+- `RAILWAY_POSTGRES_SERVICE` (default `machinocare-postgres`)
+- `RAILWAY_SKIP_CREATE_DB=1`
 
-If neither PostgreSQL nor persistent volume is attached, SQLite data resets on redeploy/restart.
+## Development and Validation
 
-## Development Notes
+### Install deps
 
-- Python dependencies are listed in `requirements.txt`.
-- Backend logic lives mainly in:
-    - `backend/main.py`
-    - `backend/storage.py`
-    - `backend/ml_engine.py`
-- Dashboard entrypoint:
-    - `dashboard/app.py`
+```bash
+pip install -r requirements.txt
+```
+
+### Compile sanity checks
+
+```bash
+python -m compileall backend dashboard
+```
+
+### Typical files to inspect while developing
+
+- `backend/main.py`
+- `backend/storage.py`
+- `backend/ml_engine.py`
+- `backend/debug_dashboard.py`
+- `dashboard/app.py`
+
+## Troubleshooting
+
+### Stream posts are accepted but profile chart is empty
+
+- Check active stream association in dashboard
+- Confirm `POST /api/v1/stream-binding` points to selected profile
+
+### Data disappears after redeploy
+
+- If using SQLite without persistent volume, data is ephemeral
+- Set `DATABASE_URL` to Railway PostgreSQL (recommended)
+
+### Debug logs are too noisy
+
+- Reduce `MACHINOCARE_DEBUG_SAMPLE_RATE`
+- Tune `MACHINOCARE_DEBUG_RETENTION_DAYS`
+
+### Dashboard cannot reach backend
+
+- Verify `MACHINOCARE_API_URL`
+- Verify health endpoint and CORS/network path
 
 ## Safety Note
 
-Start with firmware `debugMode = true` during bench testing. Switch to `debugMode = false` only when you are ready to enable hard shutdown behavior for emergency events.
+Start firmware with `debugMode = true` during bench testing.
+Switch to `debugMode = false` only when you are ready to enable hard emergency behavior.
