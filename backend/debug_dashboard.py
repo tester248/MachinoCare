@@ -231,6 +231,7 @@ def get_debug_dashboard_html() -> str:
         <div class="row"><label for="sr">sample_rate_hz</label><input id="sr" type="number" value="10" min="1" max="500" /></div>
         <div class="row"><label for="ws">window_seconds</label><input id="ws" type="number" value="1" min="1" max="10" /></div>
         <div class="row"><label for="fb">fallback_seconds</label><input id="fb" type="number" value="300" min="10" max="86400" /></div>
+        <div class="row"><label for="cd">calibration_duration_seconds</label><input id="cd" type="number" value="300" min="10" max="86400" /></div>
         <div class="row"><label for="cont">contamination</label><input id="cont" type="number" value="0.05" min="0.01" max="0.40" step="0.01" /></div>
         <div class="row"><label for="minw">min_consecutive_windows</label><input id="minw" type="number" value="3" min="1" max="10" /></div>
         <div class="row" style="align-items:flex-start;">
@@ -360,9 +361,9 @@ def get_debug_dashboard_html() -> str:
       node.textContent = text || 'Switching profile...';
     }
 
-    function toWsUrl(machine, device, lookback) {
+    function toWsUrl(deviceName, lookback) {
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const qp = new URLSearchParams({ machine_id: machine, device_id: device, lookback_seconds: String(lookback), last_log_id: String(lastLogId) });
+      const qp = new URLSearchParams({ device_name: deviceName, lookback_seconds: String(lookback), last_log_id: String(lastLogId) });
       return `${protocol}//${window.location.host}/api/v1/ws/live?${qp.toString()}`;
     }
 
@@ -508,6 +509,7 @@ def get_debug_dashboard_html() -> str:
       el('sr').value = 10;
       el('ws').value = 1;
       el('fb').value = 300;
+      el('cd').value = 300;
       el('cont').value = 0.05;
       el('minw').value = 3;
       el('notes').value = '';
@@ -523,6 +525,7 @@ def get_debug_dashboard_html() -> str:
       el('sr').value = profile.sample_rate_hz ?? 10;
       el('ws').value = profile.window_seconds ?? 1;
       el('fb').value = profile.fallback_seconds ?? 300;
+      el('cd').value = profile.calibration_duration_seconds ?? profile.fallback_seconds ?? 300;
       el('cont').value = profile.contamination ?? 0.05;
       el('minw').value = profile.min_consecutive_windows ?? 3;
       el('notes').value = profile.notes || '';
@@ -588,7 +591,12 @@ def get_debug_dashboard_html() -> str:
       const cal = status.calibration || {};
       const stage = cal.stage || 'idle';
       const progress = cal.progress == null ? 0 : cal.progress;
-      el('calibVal').textContent = `${stage} (${progress}%)`;
+      const backendVersion = status.model_summary && status.model_summary.model_version != null ? status.model_summary.model_version : 'n/a';
+      const espVersion = status.esp_model_version != null ? status.esp_model_version : 'n/a';
+      const syncState = status.esp_model_version != null && status.model_summary && status.model_summary.model_version != null && Number(status.esp_model_version) === Number(status.model_summary.model_version)
+        ? 'synced'
+        : 'waiting';
+      el('calibVal').textContent = `${stage} (${progress}%) | model ${espVersion}/${backendVersion} ${syncState}`;
     }
 
     function renderLogs() {
@@ -644,8 +652,7 @@ def get_debug_dashboard_html() -> str:
     function subscribeMessage(machine, device, lookback) {
       return {
         type: 'subscribe',
-        machine_id: machine,
-        device_id: device,
+        device_name: currentProfile() ? String(currentProfile().display_name || '').trim() : '',
         lookback_seconds: Number(lookback || 120),
         last_log_id: Number(lastLogId || 0)
       };
@@ -736,6 +743,7 @@ def get_debug_dashboard_html() -> str:
 
       const machine = profile.machine_id;
       const device = profile.device_id;
+      const deviceName = String(profile.display_name || '').trim();
       const lookback = Number(el('lookback').value || 120);
 
       if (ws) {
@@ -744,7 +752,7 @@ def get_debug_dashboard_html() -> str:
       }
 
       setConnState('connecting', 'warn');
-      ws = new WebSocket(toWsUrl(machine, device, lookback));
+      ws = new WebSocket(toWsUrl(deviceName, lookback));
 
       ws.onopen = () => {
         setConnState('connected', 'ok');
@@ -802,6 +810,7 @@ def get_debug_dashboard_html() -> str:
         sample_rate_hz: Number(el('sr').value),
         window_seconds: Number(el('ws').value),
         fallback_seconds: Number(el('fb').value),
+        calibration_duration_seconds: Number(el('cd').value),
         contamination: Number(el('cont').value),
         min_consecutive_windows: Number(el('minw').value),
         notes: el('notes').value.trim() || null,
@@ -859,6 +868,7 @@ def get_debug_dashboard_html() -> str:
         sample_rate_hz: Number(el('sr').value),
         window_seconds: Number(el('ws').value),
         fallback_seconds: Number(el('fb').value),
+        calibration_duration_seconds: Number(el('cd').value),
         contamination: Number(el('cont').value),
         min_consecutive_windows: Number(el('minw').value),
         notes: el('notes').value.trim() || null,
@@ -891,7 +901,7 @@ def get_debug_dashboard_html() -> str:
         return;
       }
 
-      const response = await fetch(`/api/v1/calibrate/start/profile/${encodeURIComponent(profile.machine_id)}/${encodeURIComponent(profile.device_id)}?new_device_setup=true&trigger_source=debug_dashboard`, {
+      const response = await fetch(`/api/v1/calibrate/start/profile/${encodeURIComponent(String(profile.display_name || '').trim())}?new_device_setup=true&trigger_source=debug_dashboard&calibration_duration_seconds=${Number(el('cd').value || 300)}`, {
         method: 'POST'
       });
 
@@ -916,8 +926,7 @@ def get_debug_dashboard_html() -> str:
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          machine_id: profile.machine_id,
-          device_id: profile.device_id,
+          device_name: String(profile.display_name || '').trim(),
           source: 'debug_dashboard',
         }),
       });
@@ -957,7 +966,7 @@ def get_debug_dashboard_html() -> str:
         return;
       }
 
-      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(profile.machine_id)}/${encodeURIComponent(profile.device_id)}`, {
+      const response = await fetch(`/api/v1/device-profiles/${encodeURIComponent(String(profile.display_name || '').trim())}`, {
         method: 'DELETE'
       });
       const text = await response.text();

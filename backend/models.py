@@ -47,6 +47,8 @@ class StreamIngestRequest(BaseModel):
 
     machine_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
     device_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
+    esp_model_version: int | None = Field(default=None, ge=0)
+    esp_model_checksum: str | None = Field(default=None, max_length=128)
     sample: Optional[StreamSample] = None
     samples: Optional[List[StreamSample]] = None
 
@@ -77,6 +79,7 @@ class CalibrationRequest(BaseModel):
     sample_rate_hz: int = Field(default=25, ge=1, le=500)
     window_seconds: int = Field(default=1, ge=1, le=10)
     fallback_seconds: int = Field(default=300, ge=10, le=86400)
+    calibration_duration_seconds: int | None = Field(default=None, ge=10, le=86400)
     contamination: float = Field(default=0.05, ge=0.01, le=0.40)
     min_consecutive_windows: int = Field(default=3, ge=1, le=10)
     new_device_setup: bool = False
@@ -108,6 +111,7 @@ class CalibrationResponse(BaseModel):
     device_name: str | None = None
     machine_id: SkipJsonSchema[str | None] = None
     device_id: SkipJsonSchema[str | None] = None
+    calibration_duration_seconds: int | None = None
     calibration_source: str
     sample_count: int
     window_count: int
@@ -121,6 +125,7 @@ class CalibrationStartResponse(BaseModel):
     device_name: str | None = None
     machine_id: SkipJsonSchema[str | None] = None
     device_id: SkipJsonSchema[str | None] = None
+    calibration_duration_seconds: int | None = None
     trigger_source: str
     new_device_setup: bool
 
@@ -133,6 +138,7 @@ class CalibrationJobStatus(BaseModel):
     device_name: str | None = None
     machine_id: SkipJsonSchema[str | None] = None
     device_id: SkipJsonSchema[str | None] = None
+    calibration_duration_seconds: int | None = None
     trigger_source: str
     new_device_setup: bool
     started_at: str

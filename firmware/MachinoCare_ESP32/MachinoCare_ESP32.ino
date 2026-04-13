@@ -811,6 +811,8 @@ void sendStreamToBackend() {
   if (getIsoTimestampForApi(apiTs)) {
     sample["timestamp"] = apiTs;
   }
+  req["esp_model_version"] = modelVersion;
+  req["esp_model_checksum"] = modelChecksum;
   sample["accMag"] = accMag;
   sample["gyroMag"] = gyroMag;
   sample["gx"] = gx;

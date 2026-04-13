@@ -452,6 +452,7 @@ with st.sidebar:
         st.session_state.form_sample_rate_hz = int((selected_profile or {}).get("sample_rate_hz") or 10)
         st.session_state.form_window_seconds = int((selected_profile or {}).get("window_seconds") or 1)
         st.session_state.form_fallback_seconds = int((selected_profile or {}).get("fallback_seconds") or 300)
+        st.session_state.form_calibration_duration_seconds = int((selected_profile or {}).get("fallback_seconds") or 300)
         st.session_state.form_contamination = float((selected_profile or {}).get("contamination") or 0.05)
         st.session_state.form_min_windows = int((selected_profile or {}).get("min_consecutive_windows") or 3)
         st.session_state.form_notes = str((selected_profile or {}).get("notes") or "")
@@ -522,6 +523,13 @@ with st.sidebar:
         step=30,
         key="form_fallback_seconds",
     )
+    calibration_duration_seconds = st.number_input(
+        "Calibration duration (s)",
+        min_value=10,
+        max_value=86400,
+        step=10,
+        key="form_calibration_duration_seconds",
+    )
     contamination = st.slider(
         "Isolation Forest contamination",
         min_value=0.01,
@@ -549,6 +557,7 @@ with st.sidebar:
                 "sample_rate_hz": int(sample_rate_hz),
                 "window_seconds": int(window_seconds),
                 "fallback_seconds": int(fallback_seconds),
+                "calibration_duration_seconds": int(calibration_duration_seconds),
                 "contamination": float(contamination),
                 "min_consecutive_windows": int(min_consecutive_windows),
                 "notes": st.session_state.form_notes.strip() or None,
@@ -585,6 +594,7 @@ with st.sidebar:
                         "sample_rate_hz": int(sample_rate_hz),
                         "window_seconds": int(window_seconds),
                         "fallback_seconds": int(fallback_seconds),
+                        "calibration_duration_seconds": int(calibration_duration_seconds),
                         "contamination": float(contamination),
                         "min_consecutive_windows": int(min_consecutive_windows),
                         "notes": st.session_state.form_notes.strip() or None,
@@ -620,6 +630,7 @@ with st.sidebar:
                     (
                         f"{api_base}/api/v1/calibrate/start/profile/{selected_device_name}"
                         f"?new_device_setup={query}&trigger_source=dashboard_ui"
+                        f"&calibration_duration_seconds={int(calibration_duration_seconds)}"
                     ),
                     method="POST",
                 )
@@ -630,6 +641,7 @@ with st.sidebar:
                     "device_id": selected_device,
                     "sample_rate_hz": int(sample_rate_hz),
                     "fallback_seconds": int(fallback_seconds),
+                    "calibration_duration_seconds": int(calibration_duration_seconds),
                     "window_seconds": int(window_seconds),
                     "contamination": float(contamination),
                     "min_consecutive_windows": int(min_consecutive_windows),
@@ -728,6 +740,26 @@ def render_live_ui() -> None:
                 ),
                 unsafe_allow_html=True,
             )
+
+    backend_model_version = model_summary.get("model_version") or calibration.get("model_version")
+    esp_model_version = status_data.get("esp_model_version")
+    model_sync = (
+        backend_model_version is not None
+        and esp_model_version is not None
+        and str(backend_model_version) == str(esp_model_version)
+    )
+    st.markdown(
+        (
+            "<div class='mc-glass'>"
+            "<div class='mc-title'>ESP Model Sync</div>"
+            f"<div class='mc-value'>{'Synced' if model_sync else 'Waiting'}"
+            f"</div><div style='margin-top:0.35rem; font-size:0.95rem;'>"
+            f"ESP: {esp_model_version if esp_model_version is not None else 'n/a'} | "
+            f"Backend: {backend_model_version if backend_model_version is not None else 'n/a'}</div>"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
     if active_job_data:
         st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)

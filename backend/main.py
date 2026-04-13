@@ -385,6 +385,11 @@ def _resolve_calibration_payload(payload: CalibrationRequest) -> CalibrationRequ
     )
 
 
+def _calibration_collection_seconds(payload: CalibrationRequest) -> int:
+    seconds = payload.calibration_duration_seconds or payload.fallback_seconds
+    return max(10, int(seconds))
+
+
 def _safe_float(value: Any) -> float | None:
     try:
         if value is None:
@@ -689,11 +694,13 @@ def resolve_calibration_samples(request: CalibrationRequest) -> tuple[list[dict[
             detail="Calibration target not resolved. Provide device_name or valid machine/device IDs.",
         )
 
+    collection_seconds = _calibration_collection_seconds(request)
+
     fallback = store.get_recent_samples(
         machine_id,
         device_id=device_id,
-        seconds=request.fallback_seconds,
-        limit=max(1000, request.sample_rate_hz * request.fallback_seconds),
+        seconds=collection_seconds,
+        limit=max(1000, request.sample_rate_hz * collection_seconds),
     )
     return fallback, "fallback_recent_stream"
 
@@ -736,6 +743,7 @@ def _to_job_status(job: dict[str, Any]) -> CalibrationJobStatus:
         device_name=device_name,
         machine_id=machine_id,
         device_id=device_id,
+        calibration_duration_seconds=job.get("calibration_duration_seconds"),
         trigger_source=job["trigger_source"],
         new_device_setup=bool(job["new_device_setup"]),
         started_at=job["started_at"],
@@ -756,6 +764,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         )
 
     device_name = _normalize_device_name(payload.device_name) or _device_name_for_ids(machine_id, device_id)
+    collection_seconds = _calibration_collection_seconds(payload)
 
     samples, source = resolve_calibration_samples(payload)
     if len(samples) < 20:
@@ -810,6 +819,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         "created_at": utc_iso_now(),
         "target_machine_id": machine_id,
         "target_device_id": device_id,
+        "calibration_duration_seconds": collection_seconds,
         "new_device_setup": payload.new_device_setup,
         "trigger_source": payload.trigger_source,
     }
@@ -840,6 +850,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         device_name=device_name,
         machine_id=machine_id,
         device_id=device_id,
+        calibration_duration_seconds=collection_seconds,
         calibration_source=source,
         sample_count=len(samples),
         window_count=int(distilled["window_count"]),
@@ -857,6 +868,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
     payload = _resolve_calibration_payload(CalibrationRequest(**payload_data))
     machine_id = str(payload.machine_id or "")
     device_id = str(payload.device_id or "")
+    collection_seconds = _calibration_collection_seconds(payload)
 
     try:
         _set_job(
@@ -864,7 +876,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             status="running",
             stage="collecting_data",
             progress=15,
-            message="Collecting baseline window data",
+            message=f"Collecting stream data for {collection_seconds}s",
         )
         state = store.get_machine_state(machine_id, device_id)
         state.update(
@@ -874,49 +886,57 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "calibration_in_progress": True,
                 "calibration_progress": 15,
                 "calibration_stage": "collecting_data",
-                "calibration_message": "Collecting baseline window data",
+                "calibration_message": f"Collecting stream data for {collection_seconds}s",
                 "active_calibration_job_id": job_id,
             }
         )
         store.set_machine_state(machine_id, device_id, state)
 
-        time.sleep(0.30)
+        start_time = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= collection_seconds:
+                break
 
-        _set_job(
-            job_id,
-            stage="extracting_features",
-            progress=45,
-            message="Building vibration feature windows",
-        )
-        state = store.get_machine_state(machine_id, device_id)
-        state.update(
-            {
-                "calibration_progress": 45,
-                "calibration_stage": "extracting_features",
-                "calibration_message": "Building vibration feature windows",
-            }
-        )
-        store.set_machine_state(machine_id, device_id, state)
+            progress = min(30, 15 + int((elapsed / max(1, collection_seconds)) * 15))
+            message = f"Collecting stream data for {collection_seconds}s ({int(elapsed)}s elapsed)"
+            _set_job(
+                job_id,
+                stage="collecting_data",
+                progress=progress,
+                message=message,
+            )
+            state = store.get_machine_state(machine_id, device_id)
+            state.update(
+                {
+                    "calibration_progress": progress,
+                    "calibration_stage": "collecting_data",
+                    "calibration_message": message,
+                }
+            )
+            store.set_machine_state(machine_id, device_id, state)
+            time.sleep(1.0)
 
-        time.sleep(0.30)
-
-        _set_job(
-            job_id,
-            stage="training_model",
-            progress=75,
-            message="Training Isolation Forest and distilling edge weights",
-        )
-        state = store.get_machine_state(machine_id, device_id)
-        state.update(
-            {
-                "calibration_progress": 75,
-                "calibration_stage": "training_model",
-                "calibration_message": "Training Isolation Forest and distilling edge weights",
-            }
-        )
-        store.set_machine_state(machine_id, device_id, state)
-
-        time.sleep(0.30)
+        for target_progress, target_stage, target_message in [
+            (45, "extracting_features", "Building vibration feature windows"),
+            (75, "training_model", "Training Isolation Forest and distilling edge weights"),
+        ]:
+            _set_job(
+                job_id,
+                stage=target_stage,
+                progress=target_progress,
+                message=target_message,
+            )
+            state = store.get_machine_state(machine_id, device_id)
+            state.update(
+                {
+                    "calibration_progress": target_progress,
+                    "calibration_stage": target_stage,
+                    "calibration_message": target_message,
+                }
+            )
+            store.set_machine_state(machine_id, device_id, state)
+            time.sleep(0.25)
 
         result = perform_calibration(payload)
 
@@ -1077,6 +1097,8 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
         **state,
         "machine_id": machine_id,
         "device_id": device_id,
+        "esp_model_version": payload.esp_model_version,
+        "esp_model_checksum": payload.esp_model_checksum,
         "last_update": last_sample["timestamp"],
         "current_acc_mag": round(last_sample["acc_mag"], 6),
         "current_gyro_mag": round(last_sample.get("gyro_mag", 0.0), 6),
@@ -1111,6 +1133,8 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
             "progress": active_job["progress"] if active_job else None,
             "stage": active_job["stage"] if active_job else None,
         },
+        "esp_model_version": state.get("esp_model_version"),
+        "esp_model_checksum": state.get("esp_model_checksum"),
     }
 
 
@@ -1143,6 +1167,7 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
         "device_name": device_name,
         "machine_id": machine_id,
         "device_id": device_id,
+        "calibration_duration_seconds": payload.calibration_duration_seconds or payload.fallback_seconds,
         "trigger_source": payload.trigger_source,
         "new_device_setup": payload.new_device_setup,
         "started_at": now,
@@ -1162,7 +1187,7 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
             "calibration_in_progress": True,
             "calibration_progress": 0,
             "calibration_stage": "queued",
-            "calibration_message": "Calibration queued",
+            "calibration_message": f"Calibration queued for {payload.calibration_duration_seconds or payload.fallback_seconds}s",
             "active_calibration_job_id": job_id,
         }
     )
@@ -1181,6 +1206,7 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
         device_name=device_name,
         machine_id=machine_id,
         device_id=device_id,
+        calibration_duration_seconds=payload.calibration_duration_seconds or payload.fallback_seconds,
         trigger_source=payload.trigger_source,
         new_device_setup=payload.new_device_setup,
     )
@@ -1191,6 +1217,7 @@ def calibrate_start_from_profile(
     device_name: str,
     new_device_setup: bool = Query(default=True),
     trigger_source: str = Query(default="dashboard_profile"),
+    calibration_duration_seconds: int | None = Query(default=None, ge=10, le=86400),
 ) -> CalibrationStartResponse:
     profile = _resolve_profile_or_404(device_name)
     machine_id = str(profile["machine_id"])
@@ -1203,6 +1230,7 @@ def calibrate_start_from_profile(
         sample_rate_hz=int(profile.get("sample_rate_hz") or 25),
         window_seconds=int(profile.get("window_seconds") or 1),
         fallback_seconds=int(profile.get("fallback_seconds") or 300),
+        calibration_duration_seconds=int(calibration_duration_seconds or profile.get("fallback_seconds") or 300),
         contamination=float(profile.get("contamination") or 0.05),
         min_consecutive_windows=int(profile.get("min_consecutive_windows") or 3),
         new_device_setup=new_device_setup,
@@ -1269,6 +1297,8 @@ def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
         "machine_id": machine_id,
         "device_id": device_id,
         "server_timestamp": utc_iso_now(),
+        "esp_model_version": state.get("esp_model_version"),
+        "esp_model_checksum": state.get("esp_model_checksum"),
         "status_label": state.get("status_label", "UNKNOWN"),
         "is_anomaly": state.get("is_anomaly", False),
         "current": {
@@ -1282,10 +1312,13 @@ def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
         "calibration": calibration_view,
         "model_summary": {
             "model_type": (package or {}).get("model_type"),
+            "model_version": (package or {}).get("model_version"),
             "window_size": (package or {}).get("effective_window_size"),
             "decision_threshold": (package or {}).get("decision_threshold"),
             "hysteresis_low": (package or {}).get("hysteresis_low"),
             "quality_correlation": (package or {}).get("quality_correlation"),
+            "esp_model_version": state.get("esp_model_version"),
+            "esp_model_checksum": state.get("esp_model_checksum"),
             "target_device_id": (package or {}).get("target_device_id"),
         },
     }
