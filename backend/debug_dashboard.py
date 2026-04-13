@@ -543,20 +543,25 @@ def get_debug_dashboard_html() -> str:
       el('notes').value = profile.notes || '';
     }
 
+    function toNumber(value) {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    }
+
     function appendSample(sample, status) {
       if (!sample || !sample.timestamp || sample.timestamp === lastTimestamp) return;
       lastTimestamp = sample.timestamp;
       timestamps.push(sample.timestamp);
 
       const values = {
-        acc_mag: sample.acc_mag,
-        gyro_mag: sample.gyro_mag,
-        gx: sample.gx,
-        gy: sample.gy,
-        gz: sample.gz,
-        sw420: sample.sw420,
-        score: status && status.current ? status.current.score : null,
-        decision_threshold: status && status.current ? status.current.decision_threshold : null,
+        acc_mag: toNumber(sample.acc_mag),
+        gyro_mag: toNumber(sample.gyro_mag),
+        gx: toNumber(sample.gx),
+        gy: toNumber(sample.gy),
+        gz: toNumber(sample.gz),
+        sw420: toNumber(sample.sw420),
+        score: status && status.current ? toNumber(status.current.score) : null,
+        decision_threshold: status && status.current ? toNumber(status.current.decision_threshold) : null,
       };
 
       for (const cfg of fieldConfig) {
