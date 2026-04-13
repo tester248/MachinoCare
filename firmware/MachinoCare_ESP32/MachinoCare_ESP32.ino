@@ -41,7 +41,8 @@ const int daylightOffset_sec = 0;
 
 // Hardware pins
 const int SW420_PIN = 34;
-const int RELAY_PIN = 25;
+const int RELAY_MOTOR_PIN = 25;
+const int RELAY_FAN_PIN = 26;
 const int LED_PIN = 27;
 const int BUZZER_PIN = 33;
 
@@ -73,7 +74,8 @@ volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
 
 // Indicator control state
-bool relayOn = true;
+bool motorOn = true;
+bool fanOn = true;
 bool buzzerManualOn = false;
 bool ledManualOn = false;
 
@@ -136,7 +138,8 @@ const int MODEL_HTTP_TIMEOUT_MS = 2500;
 // -------------------- Helpers --------------------
 
 void applyIndicators() {
-  digitalWrite(RELAY_PIN, relayOn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
   digitalWrite(BUZZER_PIN, buzzerManualOn ? BUZZER_ON : BUZZER_OFF);
   digitalWrite(LED_PIN, ledManualOn ? LED_ON : LED_OFF);
 }
@@ -151,7 +154,8 @@ void updateAlertOutputs() {
     buzzerState = ((millis() / 220) % 2) == 0;
   }
 
-  digitalWrite(RELAY_PIN, relayOn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
+  digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
   digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
   digitalWrite(BUZZER_PIN, buzzerState ? BUZZER_ON : BUZZER_OFF);
 }
@@ -197,7 +201,8 @@ void resetRuntimeForFreshCalibration() {
 
 void IRAM_ATTR emergencyKillSwitch() {
   if (!debugMode) {
-    digitalWrite(RELAY_PIN, RELAY_OFF);
+    digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
+    digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
     digitalWrite(LED_PIN, LED_ON);
     digitalWrite(BUZZER_PIN, BUZZER_ON);
   }
@@ -766,20 +771,20 @@ BLYNK_WRITE(V13) {
   calibrationAsNewDevice = (param.asInt() == 1);
 }
 
-// V14: relay
+// V14: motor relay
 BLYNK_WRITE(V14) {
-  relayOn = (param.asInt() == 1);
+  motorOn = (param.asInt() == 1);
   applyIndicators();
-  Serial.print("BLYNK_RELAY,");
-  Serial.println(relayOn ? "ON" : "OFF");
+  Serial.print("BLYNK_MOTOR,");
+  Serial.println(motorOn ? "ON" : "OFF");
 }
 
-// V15: LED
+// V15: fan relay
 BLYNK_WRITE(V15) {
-  ledManualOn = (param.asInt() == 1);
+  fanOn = (param.asInt() == 1);
   applyIndicators();
-  Serial.print("BLYNK_LED,");
-  Serial.println(ledManualOn ? "ON" : "OFF");
+  Serial.print("BLYNK_FAN,");
+  Serial.println(fanOn ? "ON" : "OFF");
 }
 
 // V20: buzzer
@@ -788,6 +793,14 @@ BLYNK_WRITE(V20) {
   applyIndicators();
   Serial.print("BLYNK_BUZZER,");
   Serial.println(buzzerManualOn ? "ON" : "OFF");
+}
+
+// V21: LED (optional manual override)
+BLYNK_WRITE(V21) {
+  ledManualOn = (param.asInt() == 1);
+  applyIndicators();
+  Serial.print("BLYNK_LED,");
+  Serial.println(ledManualOn ? "ON" : "OFF");
 }
 
 // -------------------- Main tasks --------------------
@@ -839,9 +852,10 @@ void updateBlynk() {
   Blynk.virtualWrite(V6, getTimeString());
   Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
 
-  Blynk.virtualWrite(V14, relayOn ? 1 : 0);
-  Blynk.virtualWrite(V15, ledManualOn ? 1 : 0);
+  Blynk.virtualWrite(V14, motorOn ? 1 : 0);
+  Blynk.virtualWrite(V15, fanOn ? 1 : 0);
   Blynk.virtualWrite(V20, buzzerManualOn ? 1 : 0);
+  Blynk.virtualWrite(V21, ledManualOn ? 1 : 0);
 
   Blynk.virtualWrite(V16, (int)streamSuccessCount);
   Blynk.virtualWrite(V17, (int)streamFailCount);
@@ -891,10 +905,12 @@ void setup() {
   Serial.println("S3: mpu");
 
   pinMode(SW420_PIN, INPUT);
-  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RELAY_MOTOR_PIN, OUTPUT);
+  pinMode(RELAY_FAN_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
-  relayOn = true;
+  motorOn = true;
+  fanOn = true;
   buzzerManualOn = false;
   ledManualOn = false;
   applyIndicators();
@@ -958,10 +974,12 @@ void loop() {
 
   if (emergencyTriggered) {
     if (!debugMode) {
-      relayOn = false;
+      motorOn = false;
+      fanOn = false;
       buzzerManualOn = false;
       ledManualOn = false;
-      digitalWrite(RELAY_PIN, RELAY_OFF);
+      digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
+      digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
       digitalWrite(LED_PIN, LED_ON);
       digitalWrite(BUZZER_PIN, BUZZER_ON);
 
@@ -970,7 +988,8 @@ void loop() {
       Blynk.virtualWrite(V5, 1);
 
       while (true) {
-        digitalWrite(RELAY_PIN, RELAY_OFF);
+        digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
+        digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
         digitalWrite(LED_PIN, LED_ON);
         digitalWrite(BUZZER_PIN, BUZZER_ON);
         delay(150);
