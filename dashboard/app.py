@@ -15,6 +15,27 @@ THINGSPEAK_CHANNEL_DEFAULT = os.getenv("MACHINOCARE_THINGSPEAK_CHANNEL", "333691
 UNASSIGNED_MACHINE_ID = os.getenv("MACHINOCARE_UNASSIGNED_MACHINE_ID", "unassigned_machine")
 UNASSIGNED_DEVICE_ID = os.getenv("MACHINOCARE_UNASSIGNED_DEVICE_ID", "unassigned_device")
 
+LIVE_FIELD_META: dict[str, tuple[str, str]] = {
+    "acc_mag": ("Acceleration Magnitude", "#1177cc"),
+    "gyro_mag": ("Gyroscope Magnitude", "#059669"),
+    "score": ("Anomaly Score", "#d91e18"),
+    "gx": ("Gyro X", "#5b21b6"),
+    "gy": ("Gyro Y", "#0f766e"),
+    "gz": ("Gyro Z", "#b45309"),
+    "sw420": ("SW420", "#111827"),
+}
+LIVE_PRIMARY_FIELDS = ["acc_mag", "gyro_mag", "score"]
+LIVE_AXIS_FIELDS = ["gx", "gy", "gz", "sw420"]
+
+THINGSPEAK_FIELD_META: dict[str, str] = {
+    "field1": "#1d4ed8",
+    "field2": "#0f766e",
+    "field3": "#7e22ce",
+    "field4": "#b45309",
+    "field5": "#be123c",
+    "field6": "#111827",
+}
+
 st.set_page_config(
     page_title="MachinoCare Live Control Room",
     page_icon="MM",
@@ -218,14 +239,21 @@ def request_json(url: str, method: str = "GET", payload: dict | None = None) -> 
         return None, str(exc)
 
 
-def thingspeak_history(channel_id: str, results: int = 60) -> tuple[pd.DataFrame | None, str | None]:
+def thingspeak_history(channel_id: str, results: int = 60) -> tuple[pd.DataFrame | None, dict[str, str], str | None]:
     url = f"https://api.thingspeak.com/channels/{channel_id}/feeds.json?results={results}"
     data, error = request_json(url)
     if error:
-        return None, error
+        return None, {}, error
+
+    field_labels: dict[str, str] = {}
+    channel_data = data.get("channel", {}) if data else {}
+    for field_key in THINGSPEAK_FIELD_META.keys():
+        declared = str(channel_data.get(field_key) or "").strip()
+        field_labels[field_key] = declared or field_key
+
     feeds = data.get("feeds", []) if data else []
     if not feeds:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), field_labels, None
 
     frame = pd.DataFrame(feeds)
     if "created_at" in frame.columns:
@@ -233,7 +261,7 @@ def thingspeak_history(channel_id: str, results: int = 60) -> tuple[pd.DataFrame
     for col in ["field1", "field2", "field3", "field4", "field5", "field6"]:
         if col in frame.columns:
             frame[col] = pd.to_numeric(frame[col], errors="coerce")
-    return frame, None
+    return frame, field_labels, None
 
 
 def status_badge(is_anomaly: bool, status_label: str) -> str:
@@ -642,6 +670,12 @@ def render_live_ui() -> None:
     recent_data, recent_error = request_json(
         f"{api_base}/api/v1/stream/{selected_machine}/recent?seconds={lookback_seconds}&limit=5000&device_id={selected_device}"
     )
+    debug_logs_data, debug_logs_error = request_json(
+        (
+            f"{api_base}/api/v1/debug/logs"
+            f"?machine_id={selected_machine}&device_id={selected_device}&limit=120"
+        )
+    )
 
     if status_error and recent_error:
         st.error("Unable to reach backend. Confirm FastAPI is running and URL is correct.")
@@ -689,6 +723,34 @@ def render_live_ui() -> None:
 
     left, right = st.columns([2.8, 1.2])
     with left:
+        primary_labels = [LIVE_FIELD_META[field][0] for field in LIVE_PRIMARY_FIELDS]
+        axis_labels = [LIVE_FIELD_META[field][0] for field in LIVE_AXIS_FIELDS]
+        selected_primary_labels = st.multiselect(
+            "Live primary fields",
+            options=primary_labels,
+            default=primary_labels,
+            key="live_primary_selected_labels",
+            help="Toggle which primary live metrics appear in the first chart.",
+        )
+        selected_axis_labels = st.multiselect(
+            "Live axis fields",
+            options=axis_labels,
+            default=axis_labels,
+            key="live_axis_selected_labels",
+            help="Toggle which axis/vibration fields appear in the second chart.",
+        )
+
+        selected_primary_fields = [
+            field
+            for field in LIVE_PRIMARY_FIELDS
+            if LIVE_FIELD_META[field][0] in selected_primary_labels
+        ]
+        selected_axis_fields = [
+            field
+            for field in LIVE_AXIS_FIELDS
+            if LIVE_FIELD_META[field][0] in selected_axis_labels
+        ]
+
         samples = (recent_data or {}).get("samples", [])
         frame = normalize_recent_samples(samples)
 
@@ -696,20 +758,21 @@ def render_live_ui() -> None:
             st.warning("No live samples available yet. Start streaming to /api/v1/stream.")
         else:
             fig_primary = go.Figure()
-            for col, color in [("acc_mag", "#1177cc"), ("gyro_mag", "#059669"), ("score", "#d91e18")]:
+            for col in selected_primary_fields:
                 if col in frame.columns:
+                    label, color = LIVE_FIELD_META[col]
                     fig_primary.add_trace(
                         go.Scatter(
                             x=frame["timestamp"],
                             y=frame[col],
                             mode="lines",
-                            name=col,
+                            name=label,
                             line={"color": color, "width": 2},
                         )
                     )
 
             threshold_value = current.get("decision_threshold") or model_summary.get("decision_threshold")
-            if threshold_value is not None and "score" in frame.columns:
+            if threshold_value is not None and "score" in frame.columns and "score" in selected_primary_fields:
                 fig_primary.add_hline(
                     y=float(threshold_value),
                     line_dash="dash",
@@ -728,28 +791,33 @@ def render_live_ui() -> None:
                 hovermode="x unified",
                 legend={"orientation": "h", "y": 1.1, "x": 0},
             )
-            st.plotly_chart(fig_primary, use_container_width=True)
+            if fig_primary.data:
+                st.plotly_chart(fig_primary, use_container_width=True)
+            else:
+                st.info("Select at least one primary field to display the first live chart.")
 
             fig_axes = go.Figure()
-            for col, color in [("gx", "#5b21b6"), ("gy", "#0f766e"), ("gz", "#b45309")]:
+            for col in [field for field in selected_axis_fields if field != "sw420"]:
                 if col in frame.columns:
+                    label, color = LIVE_FIELD_META[col]
                     fig_axes.add_trace(
                         go.Scatter(
                             x=frame["timestamp"],
                             y=frame[col],
                             mode="lines",
-                            name=col,
+                            name=label,
                             line={"color": color, "width": 2},
                         )
                     )
-            if "sw420" in frame.columns:
+            if "sw420" in frame.columns and "sw420" in selected_axis_fields:
+                sw420_label, sw420_color = LIVE_FIELD_META["sw420"]
                 fig_axes.add_trace(
                     go.Scatter(
                         x=frame["timestamp"],
                         y=frame["sw420"],
                         mode="lines",
-                        name="sw420",
-                        line={"color": "#111827", "width": 2, "dash": "dot"},
+                        name=sw420_label,
+                        line={"color": sw420_color, "width": 2, "dash": "dot"},
                         yaxis="y2",
                     )
                 )
@@ -766,7 +834,10 @@ def render_live_ui() -> None:
                 hovermode="x unified",
                 legend={"orientation": "h", "y": 1.1, "x": 0},
             )
-            st.plotly_chart(fig_axes, use_container_width=True)
+            if fig_axes.data:
+                st.plotly_chart(fig_axes, use_container_width=True)
+            else:
+                st.info("Select at least one axis field to display the second live chart.")
 
             latest = frame.tail(1).copy()
             if not latest.empty:
@@ -817,6 +888,30 @@ def render_live_ui() -> None:
     with st.expander("Backend Payload - Full Status JSON", expanded=False):
         st.json(status_data)
 
+    st.subheader("Live API Logs (ESP/backend)")
+    if debug_logs_error:
+        st.warning(f"Live logs unavailable: {debug_logs_error}")
+    else:
+        logs = (debug_logs_data or {}).get("logs", [])
+        if not logs:
+            st.info("No recent API logs for this profile yet.")
+        else:
+            summary_rows = [
+                {
+                    "time": item.get("created_at"),
+                    "method": item.get("method"),
+                    "endpoint": item.get("endpoint"),
+                    "status": item.get("status_code"),
+                    "latency_ms": item.get("latency_ms"),
+                    "machine": item.get("machine_id"),
+                    "device": item.get("device_id"),
+                }
+                for item in logs
+            ]
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, height=280)
+            with st.expander("Latest API log payload details", expanded=False):
+                st.json(logs[:20])
+
     with st.expander("Backend Payload - Full Recent Stream JSON", expanded=False):
         st.json(recent_data or {})
 
@@ -843,40 +938,51 @@ st.subheader("ThingSpeak Historical Trend")
 use_thingspeak = st.toggle("Load ThingSpeak history", value=False)
 if use_thingspeak:
     channel_id = st.text_input("ThingSpeak Channel ID", THINGSPEAK_CHANNEL_DEFAULT)
-    history, history_error = thingspeak_history(channel_id=channel_id, results=120)
+    history, field_labels, history_error = thingspeak_history(channel_id=channel_id, results=120)
     if history_error:
         st.error(f"ThingSpeak fetch failed: {history_error}")
     elif history is None or history.empty:
         st.info("No ThingSpeak history available.")
     else:
+        available_fields = [field for field in THINGSPEAK_FIELD_META.keys() if field in history.columns]
+        label_to_field = {
+            f"{field_labels.get(field, field)} ({field})": field
+            for field in available_fields
+        }
+        selected_thingspeak_labels = st.multiselect(
+            "ThingSpeak fields",
+            options=list(label_to_field.keys()),
+            default=list(label_to_field.keys()),
+            key=f"thingspeak_selected_fields_{channel_id}",
+            help="Toggle which ThingSpeak fields are visible in the history chart.",
+        )
+        selected_thingspeak_fields = [label_to_field[label] for label in selected_thingspeak_labels]
+
         hist_fig = go.Figure()
-        for field, color in [
-            ("field1", "#1d4ed8"),
-            ("field2", "#0f766e"),
-            ("field3", "#7e22ce"),
-            ("field4", "#b45309"),
-            ("field5", "#be123c"),
-            ("field6", "#111827"),
-        ]:
+        for field in selected_thingspeak_fields:
+            color = THINGSPEAK_FIELD_META[field]
             if field in history.columns:
                 hist_fig.add_trace(
                     go.Scatter(
                         x=history["created_at"],
                         y=history[field],
                         mode="lines+markers",
-                        name=field,
+                        name=field_labels.get(field, field),
                         line={"color": color, "width": 2},
                         marker={"size": 5},
                     )
                 )
         hist_fig.update_layout(
-            title="ThingSpeak Fields 1-6",
+            title="ThingSpeak Field History",
             template="plotly_white",
             margin={"l": 20, "r": 20, "t": 30, "b": 20},
             xaxis_title="Timestamp",
             yaxis_title="Field Value",
             hovermode="x unified",
         )
-        st.plotly_chart(hist_fig, use_container_width=True)
+        if hist_fig.data:
+            st.plotly_chart(hist_fig, use_container_width=True)
+        else:
+            st.info("Select at least one ThingSpeak field to display history.")
 
 st.caption(f"Dashboard session started at: {st.session_state.session_started_at}")

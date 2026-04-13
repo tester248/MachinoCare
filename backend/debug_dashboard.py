@@ -67,9 +67,10 @@ def get_debug_dashboard_html() -> str:
     .profiles { grid-column: span 4; }
     .logs { grid-column: span 8; }
     .payload { grid-column: span 4; }
+    .thingspeak { grid-column: span 12; }
 
     @media (max-width: 1050px) {
-      .chart, .profiles, .logs, .payload { grid-column: span 12; }
+      .chart, .profiles, .logs, .payload, .thingspeak { grid-column: span 12; }
     }
 
     .row {
@@ -271,6 +272,24 @@ def get_debug_dashboard_html() -> str:
           <pre id="payloadView">Select a log row to inspect request/response payloads.</pre>
         </div>
       </section>
+
+      <section class="card thingspeak">
+        <div class="row" style="justify-content:space-between; align-items:center;">
+          <h3 style="margin:0;">ThingSpeak Historical Trend</h3>
+          <label style="display:flex; align-items:center; gap:0.4rem; margin:0;">
+            <input id="tsEnabled" type="checkbox" />
+            Load ThingSpeak history
+          </label>
+        </div>
+        <div class="row">
+          <label for="tsChannelId">ThingSpeak Channel ID</label>
+          <input id="tsChannelId" value="3336916" style="min-width:170px;" />
+          <button id="tsRefreshBtn">Load History</button>
+        </div>
+        <div class="row" id="tsFieldControls"></div>
+        <div class="hint" id="tsHint">Enable history and click Load History.</div>
+        <div id="tsChart" style="height:360px;"></div>
+      </section>
     </div>
   </div>
 
@@ -286,10 +305,32 @@ def get_debug_dashboard_html() -> str:
       { key: 'decision_threshold', label: 'decision_threshold', color: '#0f172a' }
     ];
 
+    const thingSpeakColors = {
+      field1: '#1d4ed8',
+      field2: '#0f766e',
+      field3: '#7e22ce',
+      field4: '#b45309',
+      field5: '#be123c',
+      field6: '#111827',
+    };
+
     const traces = {};
     const timestamps = [];
     const logs = [];
     const profilesByKey = new Map();
+    const thingspeakState = {
+      channelId: '3336916',
+      fields: ['field1', 'field2', 'field3', 'field4', 'field5', 'field6'],
+      labels: {
+        field1: 'field1',
+        field2: 'field2',
+        field3: 'field3',
+        field4: 'field4',
+        field5: 'field5',
+        field6: 'field6',
+      },
+      feeds: [],
+    };
 
     let ws = null;
     let lastTimestamp = '';
@@ -348,6 +389,118 @@ def get_debug_dashboard_html() -> str:
           if (control) control.addEventListener('change', renderChart);
         }, 0);
       }
+    }
+
+    function selectedThingSpeakFields() {
+      return thingspeakState.fields.filter(field => {
+        const checkbox = el(`tsf_${field}`);
+        return checkbox && checkbox.checked;
+      });
+    }
+
+    function renderThingSpeakFieldControls() {
+      const root = el('tsFieldControls');
+      root.innerHTML = '';
+
+      for (const field of thingspeakState.fields) {
+        const id = `tsf_${field}`;
+        const label = thingspeakState.labels[field] || field;
+        const wrap = document.createElement('span');
+        wrap.innerHTML = `<label style="display:flex; align-items:center; gap:0.25rem;"><input id="${id}" type="checkbox" checked/>${label} (${field})</label>`;
+        root.appendChild(wrap);
+      }
+
+      for (const field of thingspeakState.fields) {
+        const control = el(`tsf_${field}`);
+        if (control) {
+          control.addEventListener('change', renderThingSpeakChart);
+        }
+      }
+    }
+
+    function renderThingSpeakChart() {
+      const selected = selectedThingSpeakFields();
+      const feeds = Array.isArray(thingspeakState.feeds) ? thingspeakState.feeds : [];
+      const plotData = [];
+
+      for (const field of selected) {
+        const color = thingSpeakColors[field] || '#334155';
+        const label = thingspeakState.labels[field] || field;
+        plotData.push({
+          x: feeds.map(item => item.created_at),
+          y: feeds.map(item => item[field]),
+          mode: 'lines+markers',
+          name: label,
+          line: { width: 2, color },
+          marker: { size: 5 },
+        });
+      }
+
+      Plotly.react('tsChart', plotData, {
+        margin: { l: 42, r: 18, t: 30, b: 35 },
+        template: 'plotly_white',
+        legend: { orientation: 'h' },
+        xaxis: { title: 'timestamp' },
+        yaxis: { title: 'field value' },
+        hovermode: 'x unified'
+      }, { displayModeBar: true, responsive: true });
+
+      if (plotData.length === 0) {
+        el('tsHint').textContent = 'Select at least one ThingSpeak field to display history.';
+      }
+    }
+
+    async function loadThingSpeakHistory() {
+      if (!el('tsEnabled').checked) {
+        el('tsHint').textContent = 'Enable history and click Load History.';
+        Plotly.react('tsChart', [], {
+          margin: { l: 42, r: 18, t: 20, b: 35 },
+          template: 'plotly_white',
+          xaxis: { title: 'timestamp' },
+          yaxis: { title: 'field value' }
+        }, { displayModeBar: true, responsive: true });
+        return;
+      }
+
+      const channelId = String(el('tsChannelId').value || '').trim();
+      if (!channelId) {
+        el('tsHint').textContent = 'Provide a ThingSpeak channel ID.';
+        return;
+      }
+
+      el('tsHint').textContent = 'Loading ThingSpeak history...';
+      const response = await fetch(`https://api.thingspeak.com/channels/${encodeURIComponent(channelId)}/feeds.json?results=120`);
+      if (!response.ok) {
+        el('tsHint').textContent = `ThingSpeak fetch failed (${response.status}).`;
+        return;
+      }
+
+      const payload = await response.json();
+      const channel = payload.channel || {};
+      const feedsRaw = Array.isArray(payload.feeds) ? payload.feeds : [];
+
+      thingspeakState.channelId = channelId;
+      thingspeakState.labels = {
+        field1: String(channel.field1 || 'field1'),
+        field2: String(channel.field2 || 'field2'),
+        field3: String(channel.field3 || 'field3'),
+        field4: String(channel.field4 || 'field4'),
+        field5: String(channel.field5 || 'field5'),
+        field6: String(channel.field6 || 'field6'),
+      };
+      thingspeakState.feeds = feedsRaw.map(item => ({
+        created_at: item.created_at,
+        field1: item.field1 != null ? Number(item.field1) : null,
+        field2: item.field2 != null ? Number(item.field2) : null,
+        field3: item.field3 != null ? Number(item.field3) : null,
+        field4: item.field4 != null ? Number(item.field4) : null,
+        field5: item.field5 != null ? Number(item.field5) : null,
+        field6: item.field6 != null ? Number(item.field6) : null,
+      }));
+
+      renderThingSpeakFieldControls();
+      renderThingSpeakChart();
+      el('tsHint').textContent = `Loaded ${thingspeakState.feeds.length} ThingSpeak points from channel ${channelId}.`;
     }
 
     function clearProfileForm() {
@@ -857,6 +1010,11 @@ def get_debug_dashboard_html() -> str:
       el('associateBtn').addEventListener('click', associateStream);
       el('clearAssocBtn').addEventListener('click', clearAssociation);
       el('deleteProfileBtn').addEventListener('click', deleteProfile);
+      el('tsRefreshBtn').addEventListener('click', loadThingSpeakHistory);
+      el('tsEnabled').addEventListener('change', loadThingSpeakHistory);
+
+      renderThingSpeakFieldControls();
+      renderThingSpeakChart();
     }
 
     init();
