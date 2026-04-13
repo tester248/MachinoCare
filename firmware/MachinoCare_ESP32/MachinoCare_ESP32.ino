@@ -72,6 +72,21 @@ float aiThreshold = 25000.0;
 
 volatile bool emergencyTriggered = false;
 bool isMachineFailing = false;
+bool systemLedOn = true;
+bool sw420FaultLatched = false;
+bool sw420DebugCooldownActive = false;
+bool sw420FaultAnnounced = false;
+
+volatile bool sw420InterruptPending = false;
+unsigned long sw420LastConfirmedTriggerMs = 0;
+unsigned long sw420WindowStartMs = 0;
+int sw420TriggerCountInWindow = 0;
+unsigned long sw420DebugCooldownUntilMs = 0;
+
+const unsigned long SW420_DEBOUNCE_MS = 150;
+const unsigned long SW420_WINDOW_MS = 5000;
+const int SW420_MAX_TRIGGERS = 3;
+const unsigned long SW420_DEBUG_COOLDOWN_MS = 4000;
 
 // Indicator control state
 bool motorOn = true;
@@ -132,26 +147,39 @@ float gzWindow[WINDOW_SIZE] = {0};
 int windowPos = 0;
 int windowCount = 0;
 
-const int STREAM_HTTP_TIMEOUT_MS = 1400;
-const int MODEL_HTTP_TIMEOUT_MS = 2500;
+const int STREAM_HTTP_TIMEOUT_MS = 3500;
+const int MODEL_HTTP_TIMEOUT_MS = 5000;
 
 // -------------------- Helpers --------------------
 
 void applyIndicators() {
-  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
-  digitalWrite(BUZZER_PIN, buzzerManualOn ? BUZZER_ON : BUZZER_OFF);
-  digitalWrite(LED_PIN, ledManualOn ? LED_ON : LED_OFF);
+  updateAlertOutputs();
 }
 
 void updateAlertOutputs() {
-  bool alertActive = isMachineFailing || (emergencyTriggered && !debugMode);
-  bool ledState = ledManualOn || alertActive;
-  bool buzzerState = buzzerManualOn;
+  if (sw420DebugCooldownActive && debugMode && millis() >= sw420DebugCooldownUntilMs) {
+    sw420DebugCooldownActive = false;
+    systemLedOn = true;
+    sw420FaultAnnounced = false;
+  }
+
+  bool sw420Muted = sw420DebugCooldownActive && debugMode && millis() < sw420DebugCooldownUntilMs;
+  bool alertActive = isMachineFailing;
+  bool ledState = (systemLedOn || ledManualOn) && !sw420FaultLatched && !sw420Muted;
+  bool buzzerState = buzzerManualOn && !sw420FaultLatched && !sw420Muted;
 
   if (alertActive) {
     // Pulse buzzer on alerts so it is noticeable without being continuously harsh.
     buzzerState = ((millis() / 220) % 2) == 0;
+  }
+
+  if (sw420FaultLatched) {
+    ledState = false;
+    buzzerState = false;
+    if (!debugMode) {
+      motorOn = false;
+      fanOn = false;
+    }
   }
 
   digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
@@ -200,13 +228,54 @@ void resetRuntimeForFreshCalibration() {
 }
 
 void IRAM_ATTR emergencyKillSwitch() {
-  if (!debugMode) {
-    digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
-    digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
-    digitalWrite(LED_PIN, LED_ON);
-    digitalWrite(BUZZER_PIN, BUZZER_ON);
+  sw420InterruptPending = true;
+}
+
+void processSw420Trigger() {
+  bool pending = false;
+
+  noInterrupts();
+  pending = sw420InterruptPending;
+  sw420InterruptPending = false;
+  interrupts();
+
+  if (!pending) return;
+  if (digitalRead(SW420_PIN) != HIGH) return;
+
+  unsigned long now = millis();
+  if (now - sw420LastConfirmedTriggerMs < SW420_DEBOUNCE_MS) return;
+  sw420LastConfirmedTriggerMs = now;
+
+  if (sw420WindowStartMs == 0 || now - sw420WindowStartMs > SW420_WINDOW_MS) {
+    sw420WindowStartMs = now;
+    sw420TriggerCountInWindow = 0;
+    sw420FaultAnnounced = false;
   }
-  emergencyTriggered = true;
+
+  sw420TriggerCountInWindow++;
+
+  if (sw420TriggerCountInWindow >= SW420_MAX_TRIGGERS) {
+    if (debugMode) {
+      sw420DebugCooldownActive = true;
+      sw420DebugCooldownUntilMs = now + SW420_DEBUG_COOLDOWN_MS;
+      sw420FaultLatched = false;
+      emergencyTriggered = false;
+      sw420FaultAnnounced = false;
+      Serial.println("DEBUG WARNING: SW-420 trigger window exceeded (temporary mute active)");
+    } else {
+      sw420FaultLatched = true;
+      sw420FaultAnnounced = false;
+      emergencyTriggered = true;
+    }
+  } else {
+    Serial.print("DEBUG WARNING: SW-420 trigger detected (debounced, count=");
+    Serial.print(sw420TriggerCountInWindow);
+    Serial.print(", window_ms=");
+    Serial.print(SW420_WINDOW_MS);
+    Serial.println(")");
+  }
+
+  emergencyTriggered = sw420FaultLatched;
 }
 
 String getTimeString() {
@@ -356,32 +425,47 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
     }
   }
 
-  HTTPClient http;
-  bool beginOk = false;
-  if (url.startsWith("https://")) {
-    apiClient.setInsecure();
-    beginOk = http.begin(apiClient, url);
-  } else {
-    WiFiClient plainClient;
-    beginOk = http.begin(plainClient, url);
+  for (int attempt = 0; attempt < 2; attempt++) {
+    HTTPClient http;
+    bool beginOk = false;
+    if (url.startsWith("https://")) {
+      apiClient.setInsecure();
+      beginOk = http.begin(apiClient, url);
+    } else {
+      WiFiClient plainClient;
+      beginOk = http.begin(plainClient, url);
+    }
+
+    if (!beginOk) {
+      if (statusCodeOut) *statusCodeOut = -2;
+      return false;
+    }
+
+    http.setConnectTimeout(timeoutMs);
+    http.setTimeout(timeoutMs);
+    http.setReuse(false);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Accept", "application/json");
+
+    int code = http.POST(payload);
+    if (statusCodeOut) *statusCodeOut = code;
+    if (code > 0) responseOut = http.getString();
+
+    http.end();
+
+    if (code >= 200 && code < 300) {
+      return true;
+    }
+
+    if (code != -11 && code != -1) {
+      return false;
+    }
+
+    ensureWiFiConnection();
+    delay(40);
   }
 
-  if (!beginOk) {
-    if (statusCodeOut) *statusCodeOut = -2;
-    return false;
-  }
-
-  http.setConnectTimeout(timeoutMs);
-  http.setTimeout(timeoutMs);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Accept", "application/json");
-
-  int code = http.POST(payload);
-  if (statusCodeOut) *statusCodeOut = code;
-  if (code > 0) responseOut = http.getString();
-
-  http.end();
-  return (code >= 200 && code < 300);
+  return false;
 }
 
 bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
@@ -398,30 +482,45 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
     }
   }
 
-  HTTPClient http;
-  bool beginOk = false;
-  if (url.startsWith("https://")) {
-    apiClient.setInsecure();
-    beginOk = http.begin(apiClient, url);
-  } else {
-    WiFiClient plainClient;
-    beginOk = http.begin(plainClient, url);
+  for (int attempt = 0; attempt < 2; attempt++) {
+    HTTPClient http;
+    bool beginOk = false;
+    if (url.startsWith("https://")) {
+      apiClient.setInsecure();
+      beginOk = http.begin(apiClient, url);
+    } else {
+      WiFiClient plainClient;
+      beginOk = http.begin(plainClient, url);
+    }
+
+    if (!beginOk) {
+      if (statusCodeOut) *statusCodeOut = -2;
+      return false;
+    }
+
+    http.setConnectTimeout(timeoutMs);
+    http.setTimeout(timeoutMs);
+    http.setReuse(false);
+
+    int code = http.GET();
+    if (statusCodeOut) *statusCodeOut = code;
+    if (code > 0) responseOut = http.getString();
+
+    http.end();
+
+    if (code >= 200 && code < 300) {
+      return true;
+    }
+
+    if (code != -11 && code != -1) {
+      return false;
+    }
+
+    ensureWiFiConnection();
+    delay(40);
   }
 
-  if (!beginOk) {
-    if (statusCodeOut) *statusCodeOut = -2;
-    return false;
-  }
-
-  http.setConnectTimeout(timeoutMs);
-  http.setTimeout(timeoutMs);
-
-  int code = http.GET();
-  if (statusCodeOut) *statusCodeOut = code;
-  if (code > 0) responseOut = http.getString();
-
-  http.end();
-  return (code >= 200 && code < 300);
+  return false;
 }
 
 bool refreshActiveBinding(bool force = false) {
@@ -731,6 +830,7 @@ void sendStreamToBackend() {
     lastStreamHttpCode = httpCode;
     if (httpCode == -1) lastStreamResult = "FAIL: WIFI_DOWN";
     else if (httpCode == -2) lastStreamResult = "FAIL: HTTP_BEGIN";
+    else if (httpCode == -11) lastStreamResult = "FAIL: HTTP_TIMEOUT";
     else lastStreamResult = "FAIL: HTTP_" + String(httpCode);
 
     Serial.print("STREAM_FAIL,code=");
@@ -933,6 +1033,7 @@ void setup() {
   fanOn = true;
   buzzerManualOn = false;
   ledManualOn = false;
+  systemLedOn = true;
   applyIndicators();
   Serial.println("S4: pins");
 
@@ -992,31 +1093,34 @@ void setup() {
 void loop() {
   ensureWiFiConnection();
 
-  if (emergencyTriggered) {
+  processSw420Trigger();
+
+  if (sw420FaultLatched && !sw420FaultAnnounced) {
     if (!debugMode) {
-      motorOn = false;
-      fanOn = false;
-      buzzerManualOn = false;
-      ledManualOn = false;
+      Blynk.logEvent("critical_failure", "SW-420 hardware kill switch activated");
+      Serial.println("EMERGENCY SHUTDOWN: SW-420 trigger window exceeded");
+      Blynk.virtualWrite(V5, 1);
+    } else {
+      Serial.println("DEBUG WARNING: SW-420 trigger window exceeded (shutdown bypassed)");
+    }
+    sw420FaultAnnounced = true;
+  }
+
+  if (sw420FaultLatched && !debugMode) {
+    motorOn = false;
+    fanOn = false;
+    buzzerManualOn = false;
+    ledManualOn = false;
+    systemLedOn = false;
+
+    updateAlertOutputs();
+
+    while (true) {
       digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
       digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
-      digitalWrite(LED_PIN, LED_ON);
-      digitalWrite(BUZZER_PIN, BUZZER_ON);
-
-      Blynk.logEvent("critical_failure", "SW-420 hardware kill switch activated");
-      Serial.println("EMERGENCY SHUTDOWN: system locked");
-      Blynk.virtualWrite(V5, 1);
-
-      while (true) {
-        digitalWrite(RELAY_MOTOR_PIN, RELAY_OFF);
-        digitalWrite(RELAY_FAN_PIN, RELAY_OFF);
-        digitalWrite(LED_PIN, LED_ON);
-        digitalWrite(BUZZER_PIN, BUZZER_ON);
-        delay(150);
-      }
-    } else {
-      Serial.println("DEBUG WARNING: SW-420 trigger detected (shutdown bypassed)");
-      emergencyTriggered = false;
+      digitalWrite(LED_PIN, LED_OFF);
+      digitalWrite(BUZZER_PIN, BUZZER_OFF);
+      delay(150);
     }
   }
 

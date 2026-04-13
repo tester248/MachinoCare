@@ -137,6 +137,10 @@ class DataStore:
             return next(iter(row.values()), None)
         return row[0]
 
+    @staticmethod
+    def normalize_device_name(value: str) -> str:
+        return str(value or "").strip()
+
     def _init_db(self) -> None:
         if self.backend == "postgres":
             id_column = "BIGSERIAL PRIMARY KEY"
@@ -629,6 +633,34 @@ class DataStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def get_device_profile_by_name(self, device_name: str) -> dict[str, Any] | None:
+        name = self.normalize_device_name(device_name)
+        if not name:
+            return None
+
+        row = self.conn.execute(
+            """
+            SELECT
+                machine_id,
+                device_id,
+                display_name,
+                sample_rate_hz,
+                window_seconds,
+                fallback_seconds,
+                contamination,
+                min_consecutive_windows,
+                notes,
+                created_at,
+                updated_at
+            FROM device_profiles
+            WHERE lower(display_name) = lower(?)
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            (name,),
+        ).fetchone()
+        return dict(row) if row else None
+
     def list_device_profiles(
         self,
         machine_id: str | None = None,
@@ -683,6 +715,30 @@ class DataStore:
             ):
                 self.clear_stream_binding(source="profile_deleted")
         return deleted
+
+    def delete_device_profile_by_name(self, device_name: str) -> dict[str, Any] | None:
+        profile = self.get_device_profile_by_name(device_name)
+        if not profile:
+            return None
+
+        deleted = self.delete_device_profile(str(profile["machine_id"]), str(profile["device_id"]))
+        if not deleted:
+            return None
+        return profile
+
+    def list_device_names(self, *, limit: int = 500) -> list[str]:
+        rows = self.conn.execute(
+            """
+            SELECT DISTINCT display_name
+            FROM device_profiles
+            WHERE display_name IS NOT NULL AND trim(display_name) <> ''
+            ORDER BY lower(display_name) ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        names = [str(self._first_value(row) or "").strip() for row in rows]
+        return [name for name in names if name]
 
     def get_stream_binding(self, binding_name: str = "primary") -> dict[str, Any] | None:
         row = self.conn.execute(

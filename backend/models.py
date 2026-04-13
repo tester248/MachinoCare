@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.json_schema import SkipJsonSchema
 
 
 def utc_now() -> datetime:
@@ -44,8 +45,8 @@ class StreamIngestRequest(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    machine_id: str = Field(default="esp_reported_machine", min_length=1, max_length=64)
-    device_id: str = Field(default="esp32_unknown", min_length=1, max_length=64)
+    machine_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
+    device_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
     sample: Optional[StreamSample] = None
     samples: Optional[List[StreamSample]] = None
 
@@ -68,8 +69,9 @@ class CalibrationRequest(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    machine_id: str = Field(min_length=1, max_length=64)
-    device_id: str = Field(default="esp32_unknown", min_length=1, max_length=64)
+    device_name: str | None = Field(default=None, max_length=128)
+    machine_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
+    device_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
     baseline_samples: Optional[List[StreamSample]] = None
     magnitudes: Optional[List[float]] = None
     sample_rate_hz: int = Field(default=25, ge=1, le=500)
@@ -91,11 +93,21 @@ class CalibrationRequest(BaseModel):
             raise ValueError("All magnitudes must be non-negative.")
         return values
 
+    @model_validator(mode="after")
+    def validate_target(self) -> "CalibrationRequest":
+        if self.device_name and self.device_name.strip():
+            self.device_name = self.device_name.strip()
+            return self
+        if self.machine_id and self.device_id:
+            return self
+        raise ValueError("Provide 'device_name' (or both 'machine_id' and 'device_id').")
+
 
 class CalibrationResponse(BaseModel):
     status: str
-    machine_id: str
-    device_id: str
+    device_name: str | None = None
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     calibration_source: str
     sample_count: int
     window_count: int
@@ -106,8 +118,9 @@ class CalibrationResponse(BaseModel):
 class CalibrationStartResponse(BaseModel):
     status: str
     job_id: str
-    machine_id: str
-    device_id: str
+    device_name: str | None = None
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     trigger_source: str
     new_device_setup: bool
 
@@ -117,8 +130,9 @@ class CalibrationJobStatus(BaseModel):
     status: str
     stage: str
     progress: int
-    machine_id: str
-    device_id: str
+    device_name: str | None = None
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     trigger_source: str
     new_device_setup: bool
     started_at: str
@@ -129,9 +143,10 @@ class CalibrationJobStatus(BaseModel):
 
 
 class DeviceProfileUpsertRequest(BaseModel):
-    machine_id: str = Field(min_length=1, max_length=64)
-    device_id: str = Field(min_length=1, max_length=64)
+    device_name: str | None = Field(default=None, max_length=128)
     display_name: str | None = Field(default=None, max_length=128)
+    machine_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
+    device_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
     sample_rate_hz: int | None = Field(default=None, ge=1, le=500)
     window_seconds: int | None = Field(default=None, ge=1, le=10)
     fallback_seconds: int | None = Field(default=None, ge=10, le=86400)
@@ -139,10 +154,20 @@ class DeviceProfileUpsertRequest(BaseModel):
     min_consecutive_windows: int | None = Field(default=None, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=1000)
 
+    @model_validator(mode="after")
+    def normalize_device_name(self) -> "DeviceProfileUpsertRequest":
+        name = (self.device_name or self.display_name or "").strip()
+        if not name:
+            raise ValueError("Provide 'device_name' (or 'display_name').")
+        self.device_name = name
+        self.display_name = name
+        return self
+
 
 class DeviceProfileResponse(BaseModel):
-    machine_id: str
-    device_id: str
+    device_name: str
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     display_name: str | None = None
     sample_rate_hz: int | None = None
     window_seconds: int | None = None
@@ -155,15 +180,26 @@ class DeviceProfileResponse(BaseModel):
 
 
 class StreamBindingUpsertRequest(BaseModel):
-    machine_id: str = Field(min_length=1, max_length=64)
-    device_id: str = Field(min_length=1, max_length=64)
+    device_name: str | None = Field(default=None, max_length=128)
+    machine_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
+    device_id: SkipJsonSchema[str | None] = Field(default=None, min_length=1, max_length=64)
     source: str = Field(default="dashboard_manual", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> "StreamBindingUpsertRequest":
+        if self.device_name and self.device_name.strip():
+            self.device_name = self.device_name.strip()
+            return self
+        if self.machine_id and self.device_id:
+            return self
+        raise ValueError("Provide 'device_name' (or both 'machine_id' and 'device_id').")
 
 
 class StreamBindingResponse(BaseModel):
     binding_name: str
-    machine_id: str | None = None
-    device_id: str | None = None
+    device_name: str | None = None
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     source: str | None = None
     is_active: bool = False
     updated_at: str | None = None
@@ -174,8 +210,8 @@ class ApiDebugLogEntry(BaseModel):
     created_at: str
     endpoint: str
     method: str
-    machine_id: str | None = None
-    device_id: str | None = None
+    machine_id: SkipJsonSchema[str | None] = None
+    device_id: SkipJsonSchema[str | None] = None
     status_code: int | None = None
     latency_ms: int | None = None
     request_size: int | None = None

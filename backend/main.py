@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import threading
 import time
 import uuid
@@ -135,20 +136,45 @@ def truncate_payload(payload: Any) -> Any:
 def extract_machine_device(path: str, payload: Any, query_params: dict[str, str]) -> tuple[str | None, str | None]:
     machine_id = None
     device_id = None
+    device_name = None
 
     if isinstance(payload, dict):
         machine_id = payload.get("machine_id")
         device_id = payload.get("device_id")
+        device_name = payload.get("device_name")
 
     machine_id = machine_id or query_params.get("machine_id")
     device_id = device_id or query_params.get("device_id")
+    device_name = device_name or query_params.get("device_name")
+
+    if device_name and (not machine_id or not device_id):
+        profile = store.get_device_profile_by_name(str(device_name))
+        if profile:
+            machine_id = machine_id or profile.get("machine_id")
+            device_id = device_id or profile.get("device_id")
 
     parts = [part for part in path.split("/") if part]
     if len(parts) >= 4 and parts[0] == "api" and parts[1] == "v1":
-        if parts[2] in {"status", "stream", "anomaly-log", "devices", "model"}:
-            machine_id = machine_id or parts[3]
-        if len(parts) >= 5 and parts[2] in {"status", "model"}:
-            device_id = device_id or parts[4]
+        if parts[2] in {"status", "model", "insights", "anomaly-log"}:
+            device_name_from_path = parts[3]
+            profile = store.get_device_profile_by_name(device_name_from_path)
+            if profile:
+                machine_id = machine_id or profile.get("machine_id")
+                device_id = device_id or profile.get("device_id")
+
+        if parts[2] == "stream" and len(parts) >= 5 and parts[3] == "recent":
+            device_name_from_path = parts[4]
+            profile = store.get_device_profile_by_name(device_name_from_path)
+            if profile:
+                machine_id = machine_id or profile.get("machine_id")
+                device_id = device_id or profile.get("device_id")
+
+        if parts[2] == "calibrate" and len(parts) >= 6 and parts[3] == "start" and parts[4] == "profile":
+            device_name_from_path = parts[5]
+            profile = store.get_device_profile_by_name(device_name_from_path)
+            if profile:
+                machine_id = machine_id or profile.get("machine_id")
+                device_id = device_id or profile.get("device_id")
 
     return machine_id, device_id
 
@@ -263,6 +289,100 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _normalize_device_name(value: str | None) -> str:
+    return str(value or "").strip()
+
+
+def _slugify_device_name(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return normalized or "device"
+
+
+def _build_profile_ids_for_name(device_name: str) -> tuple[str, str]:
+    base = _slugify_device_name(device_name)
+    suffix = 1
+    while True:
+        machine_id = base if suffix == 1 else f"{base}_{suffix}"
+        device_id = f"{machine_id}_device"
+        if not store.get_device_profile(machine_id, device_id):
+            return machine_id, device_id
+        suffix += 1
+
+
+def _resolve_profile_or_404(device_name: str) -> dict[str, Any]:
+    normalized = _normalize_device_name(device_name)
+    if not normalized:
+        raise HTTPException(status_code=400, detail="device_name is required")
+
+    profile = store.get_device_profile_by_name(normalized)
+    if not profile:
+        raise HTTPException(status_code=404, detail=f"Device profile '{normalized}' not found.")
+    return profile
+
+
+def _resolve_machine_device_from_name(device_name: str) -> tuple[str, str]:
+    profile = _resolve_profile_or_404(device_name)
+    return str(profile["machine_id"]), str(profile["device_id"])
+
+
+def _profile_response(profile: dict[str, Any]) -> DeviceProfileResponse:
+    row = dict(profile)
+    row["device_name"] = str(row.get("display_name") or "")
+    return DeviceProfileResponse(**row)
+
+
+def _binding_with_device_name(binding: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not binding:
+        return None
+
+    item = dict(binding)
+    machine_id = item.get("machine_id")
+    device_id = item.get("device_id")
+    if machine_id and device_id:
+        profile = store.get_device_profile(str(machine_id), str(device_id))
+        item["device_name"] = (profile or {}).get("display_name")
+    else:
+        item["device_name"] = None
+    return item
+
+
+def _device_name_for_ids(machine_id: str, device_id: str) -> str | None:
+    profile = store.get_device_profile(machine_id, device_id)
+    name = str((profile or {}).get("display_name") or "").strip()
+    return name or None
+
+
+def _resolve_calibration_payload(payload: CalibrationRequest) -> CalibrationRequest:
+    machine_id = str(payload.machine_id or "").strip()
+    device_id = str(payload.device_id or "").strip()
+
+    if machine_id and device_id:
+        device_name = _normalize_device_name(payload.device_name) or _device_name_for_ids(machine_id, device_id)
+        return payload.model_copy(
+            update={
+                "machine_id": machine_id,
+                "device_id": device_id,
+                "device_name": device_name,
+            }
+        )
+
+    normalized_name = _normalize_device_name(payload.device_name)
+    if not normalized_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide 'device_name' (or both 'machine_id' and 'device_id').",
+        )
+
+    profile = _resolve_profile_or_404(normalized_name)
+    return payload.model_copy(
+        update={
+            "device_name": normalized_name,
+            "machine_id": str(profile["machine_id"]),
+            "device_id": str(profile["device_id"]),
+        }
+    )
 
 
 def _safe_float(value: Any) -> float | None:
@@ -561,9 +681,17 @@ def resolve_calibration_samples(request: CalibrationRequest) -> tuple[list[dict[
             )
         return generated, "payload_magnitudes"
 
+    machine_id = str(request.machine_id or "").strip()
+    device_id = str(request.device_id or "").strip()
+    if not machine_id or not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Calibration target not resolved. Provide device_name or valid machine/device IDs.",
+        )
+
     fallback = store.get_recent_samples(
-        request.machine_id,
-        device_id=request.device_id,
+        machine_id,
+        device_id=device_id,
         seconds=request.fallback_seconds,
         limit=max(1000, request.sample_rate_hz * request.fallback_seconds),
     )
@@ -596,13 +724,18 @@ def _active_calibration_for_device(machine_id: str, device_id: str) -> dict[str,
 
 
 def _to_job_status(job: dict[str, Any]) -> CalibrationJobStatus:
+    machine_id = str(job.get("machine_id") or "").strip()
+    device_id = str(job.get("device_id") or "").strip()
+    device_name = _normalize_device_name(job.get("device_name")) or _device_name_for_ids(machine_id, device_id)
+
     return CalibrationJobStatus(
         job_id=job["job_id"],
         status=job["status"],
         stage=job["stage"],
         progress=int(job["progress"]),
-        machine_id=job["machine_id"],
-        device_id=job["device_id"],
+        device_name=device_name,
+        machine_id=machine_id,
+        device_id=device_id,
         trigger_source=job["trigger_source"],
         new_device_setup=bool(job["new_device_setup"]),
         started_at=job["started_at"],
@@ -614,6 +747,16 @@ def _to_job_status(job: dict[str, Any]) -> CalibrationJobStatus:
 
 
 def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
+    machine_id = str(payload.machine_id or "").strip()
+    device_id = str(payload.device_id or "").strip()
+    if not machine_id or not device_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Calibration target not resolved. Provide device_name or valid machine/device IDs.",
+        )
+
+    device_name = _normalize_device_name(payload.device_name) or _device_name_for_ids(machine_id, device_id)
+
     samples, source = resolve_calibration_samples(payload)
     if len(samples) < 20:
         raise HTTPException(
@@ -642,7 +785,7 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
     )
     baseline_stats = acc_threshold_stats(samples)
 
-    existing = store.get_model_package(payload.machine_id, payload.device_id)
+    existing = store.get_model_package(machine_id, device_id)
     new_version = int(existing["model_version"]) + 1 if existing else 1
 
     package = {
@@ -665,20 +808,20 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         "trained_on_windows": int(distilled["window_count"]),
         "trained_on_samples": len(samples),
         "created_at": utc_iso_now(),
-        "target_machine_id": payload.machine_id,
-        "target_device_id": payload.device_id,
+        "target_machine_id": machine_id,
+        "target_device_id": device_id,
         "new_device_setup": payload.new_device_setup,
         "trigger_source": payload.trigger_source,
     }
     package["checksum"] = build_checksum(package)
 
-    store.save_model_package(payload.machine_id, payload.device_id, package, baseline_stats)
+    store.save_model_package(machine_id, device_id, package, baseline_stats)
 
-    state = store.get_machine_state(payload.machine_id, payload.device_id)
+    state = store.get_machine_state(machine_id, device_id)
     state.update(
         {
-            "machine_id": payload.machine_id,
-            "device_id": payload.device_id,
+            "machine_id": machine_id,
+            "device_id": device_id,
             "last_calibration_at": package["created_at"],
             "model_version": new_version,
             "model_checksum": package["checksum"],
@@ -690,12 +833,13 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
             "calibration_message": "Model package ready for device",
         }
     )
-    store.set_machine_state(payload.machine_id, payload.device_id, state)
+    store.set_machine_state(machine_id, device_id, state)
 
     return CalibrationResponse(
         status="success",
-        machine_id=payload.machine_id,
-        device_id=payload.device_id,
+        device_name=device_name,
+        machine_id=machine_id,
+        device_id=device_id,
         calibration_source=source,
         sample_count=len(samples),
         window_count=int(distilled["window_count"]),
@@ -710,7 +854,9 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
 
 
 def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
-    payload = CalibrationRequest(**payload_data)
+    payload = _resolve_calibration_payload(CalibrationRequest(**payload_data))
+    machine_id = str(payload.machine_id or "")
+    device_id = str(payload.device_id or "")
 
     try:
         _set_job(
@@ -720,11 +866,11 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             progress=15,
             message="Collecting baseline window data",
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
-                "machine_id": payload.machine_id,
-                "device_id": payload.device_id,
+                "machine_id": machine_id,
+                "device_id": device_id,
                 "calibration_in_progress": True,
                 "calibration_progress": 15,
                 "calibration_stage": "collecting_data",
@@ -732,7 +878,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "active_calibration_job_id": job_id,
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
         time.sleep(0.30)
 
@@ -742,7 +888,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             progress=45,
             message="Building vibration feature windows",
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
                 "calibration_progress": 45,
@@ -750,7 +896,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "calibration_message": "Building vibration feature windows",
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
         time.sleep(0.30)
 
@@ -760,7 +906,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             progress=75,
             message="Training Isolation Forest and distilling edge weights",
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
                 "calibration_progress": 75,
@@ -768,7 +914,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "calibration_message": "Training Isolation Forest and distilling edge weights",
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
         time.sleep(0.30)
 
@@ -782,7 +928,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             message="Calibration completed and model package generated",
             result=result.model_dump(),
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
                 "calibration_in_progress": False,
@@ -792,7 +938,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "active_calibration_job_id": None,
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
     except HTTPException as exc:
         _set_job(
@@ -803,7 +949,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             error=str(exc.detail),
             message="Calibration failed",
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
                 "calibration_in_progress": False,
@@ -813,7 +959,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "active_calibration_job_id": None,
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
     except Exception as exc:  # noqa: BLE001
         _set_job(
@@ -824,7 +970,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
             error=str(exc),
             message="Calibration failed due to unexpected error",
         )
-        state = store.get_machine_state(payload.machine_id, payload.device_id)
+        state = store.get_machine_state(machine_id, device_id)
         state.update(
             {
                 "calibration_in_progress": False,
@@ -834,7 +980,7 @@ def _run_calibration_job(job_id: str, payload_data: dict[str, Any]) -> None:
                 "active_calibration_job_id": None,
             }
         )
-        store.set_machine_state(payload.machine_id, payload.device_id, state)
+        store.set_machine_state(machine_id, device_id, state)
 
 
 @router.get("/health")
@@ -856,9 +1002,9 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
     if len(samples) > 4000:
         raise HTTPException(status_code=413, detail="Payload too large. Reduce batch size.")
 
-    reported_machine_id = payload.machine_id
-    reported_device_id = payload.device_id
     machine_id, device_id, binding = resolve_stream_target(payload)
+    profile = store.get_device_profile(machine_id, device_id)
+    device_name = (profile or {}).get("display_name")
 
     store.add_samples(machine_id, device_id, samples)
 
@@ -944,19 +1090,15 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
         "calibration_stage": active_job["stage"] if active_job else state.get("calibration_stage"),
         "calibration_message": active_job["message"] if active_job else state.get("calibration_message"),
         "active_calibration_job_id": active_job["job_id"] if active_job else state.get("active_calibration_job_id"),
-        "reported_machine_id": reported_machine_id,
-        "reported_device_id": reported_device_id,
     }
     store.set_machine_state(machine_id, device_id, new_state)
 
-    binding_view = StreamBindingResponse(**binding).model_dump() if binding else None
+    binding_with_name = _binding_with_device_name(binding)
+    binding_view = StreamBindingResponse(**binding_with_name).model_dump() if binding_with_name else None
 
     return {
         "status": "queued",
-        "machine_id": machine_id,
-        "device_id": device_id,
-        "reported_machine_id": reported_machine_id,
-        "reported_device_id": reported_device_id,
+        "device_name": device_name,
         "received_samples": len(samples),
         "server_timestamp": utc_iso_now(),
         "is_anomaly": is_anomaly,
@@ -974,13 +1116,19 @@ def ingest_stream(payload: StreamIngestRequest) -> dict[str, Any]:
 
 @router.post("/calibrate/start", response_model=CalibrationStartResponse)
 def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
-    active = _active_calibration_for_device(payload.machine_id, payload.device_id)
+    payload = _resolve_calibration_payload(payload)
+    machine_id = str(payload.machine_id or "")
+    device_id = str(payload.device_id or "")
+    device_name = _normalize_device_name(payload.device_name) or _device_name_for_ids(machine_id, device_id)
+
+    active = _active_calibration_for_device(machine_id, device_id)
     if active:
         return CalibrationStartResponse(
             status="already_running",
             job_id=active["job_id"],
-            machine_id=payload.machine_id,
-            device_id=payload.device_id,
+            device_name=device_name,
+            machine_id=machine_id,
+            device_id=device_id,
             trigger_source=payload.trigger_source,
             new_device_setup=payload.new_device_setup,
         )
@@ -992,8 +1140,9 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
         "status": "queued",
         "stage": "queued",
         "progress": 0,
-        "machine_id": payload.machine_id,
-        "device_id": payload.device_id,
+        "device_name": device_name,
+        "machine_id": machine_id,
+        "device_id": device_id,
         "trigger_source": payload.trigger_source,
         "new_device_setup": payload.new_device_setup,
         "started_at": now,
@@ -1005,11 +1154,11 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
     with calibration_jobs_lock:
         calibration_jobs[job_id] = job
 
-    state = store.get_machine_state(payload.machine_id, payload.device_id)
+    state = store.get_machine_state(machine_id, device_id)
     state.update(
         {
-            "machine_id": payload.machine_id,
-            "device_id": payload.device_id,
+            "machine_id": machine_id,
+            "device_id": device_id,
             "calibration_in_progress": True,
             "calibration_progress": 0,
             "calibration_stage": "queued",
@@ -1017,7 +1166,7 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
             "active_calibration_job_id": job_id,
         }
     )
-    store.set_machine_state(payload.machine_id, payload.device_id, state)
+    store.set_machine_state(machine_id, device_id, state)
 
     thread = threading.Thread(
         target=_run_calibration_job,
@@ -1029,28 +1178,26 @@ def calibrate_start(payload: CalibrationRequest) -> CalibrationStartResponse:
     return CalibrationStartResponse(
         status="queued",
         job_id=job_id,
-        machine_id=payload.machine_id,
-        device_id=payload.device_id,
+        device_name=device_name,
+        machine_id=machine_id,
+        device_id=device_id,
         trigger_source=payload.trigger_source,
         new_device_setup=payload.new_device_setup,
     )
 
 
-@router.post("/calibrate/start/profile/{machine_id}/{device_id}", response_model=CalibrationStartResponse)
+@router.post("/calibrate/start/profile/{device_name}", response_model=CalibrationStartResponse)
 def calibrate_start_from_profile(
-    machine_id: str,
-    device_id: str,
+    device_name: str,
     new_device_setup: bool = Query(default=True),
     trigger_source: str = Query(default="dashboard_profile"),
 ) -> CalibrationStartResponse:
-    profile = store.get_device_profile(machine_id, device_id)
-    if not profile:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No device profile found for machine '{machine_id}', device '{device_id}'.",
-        )
+    profile = _resolve_profile_or_404(device_name)
+    machine_id = str(profile["machine_id"])
+    device_id = str(profile["device_id"])
 
     payload = CalibrationRequest(
+        device_name=_normalize_device_name(device_name),
         machine_id=machine_id,
         device_id=device_id,
         sample_rate_hz=int(profile.get("sample_rate_hz") or 25),
@@ -1074,40 +1221,26 @@ def calibrate_status(job_id: str) -> CalibrationJobStatus:
 
 @router.post("/calibrate", response_model=CalibrationResponse)
 def calibrate(payload: CalibrationRequest) -> CalibrationResponse:
+    payload = _resolve_calibration_payload(payload)
     return perform_calibration(payload)
 
 
-@router.get("/model/{machine_id}/{device_id}")
-def get_model_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
+@router.get("/model/{device_name}")
+def get_model_for_device(device_name: str) -> dict[str, Any]:
+    machine_id, device_id = _resolve_machine_device_from_name(device_name)
     package = store.get_model_package(machine_id, device_id)
     if not package:
         raise HTTPException(
             status_code=404,
-            detail=f"No model package found for machine '{machine_id}', device '{device_id}'.",
+            detail=f"No model package found for device '{device_name}'.",
         )
     return {
         "status": "success",
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": _normalize_device_name(device_name),
         "model_package": package,
     }
 
 
-@router.get("/model/{machine_id}")
-def get_model(machine_id: str) -> dict[str, Any]:
-    package = store.get_model_package(machine_id)
-    if not package:
-        raise HTTPException(status_code=404, detail=f"No model package found for machine '{machine_id}'.")
-
-    return {
-        "status": "success",
-        "machine_id": machine_id,
-        "device_id": package.get("target_device_id"),
-        "model_package": package,
-    }
-
-
-@router.get("/status/{machine_id}/{device_id}")
 def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
     state = store.get_machine_state(machine_id, device_id)
     latest_sample = store.get_latest_sample_for_device(machine_id=machine_id, device_id=device_id)
@@ -1158,34 +1291,42 @@ def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
     }
 
 
-@router.get("/status/{machine_id}")
-def get_status(machine_id: str) -> dict[str, Any]:
-    latest_device = store.latest_device_for_machine(machine_id)
-    if not latest_device:
-        raise HTTPException(status_code=404, detail=f"Machine '{machine_id}' has no data yet.")
-    return get_status_for_device(machine_id, latest_device)
+@router.get("/status/{device_name}")
+def get_status(device_name: str) -> dict[str, Any]:
+    machine_id, device_id = _resolve_machine_device_from_name(device_name)
+    payload = get_status_for_device(machine_id, device_id)
+    payload["device_name"] = _normalize_device_name(device_name)
+    payload.pop("machine_id", None)
+    payload.pop("device_id", None)
+    return payload
 
 
-@router.get("/insights/{machine_id}/{device_id}")
+@router.get("/insights/{device_name}")
 def machine_insights(
-    machine_id: str,
-    device_id: str,
+    device_name: str,
     regenerate: bool = Query(default=False),
 ) -> dict[str, Any]:
-    return _build_machine_insight(machine_id, device_id, force_regenerate=bool(regenerate))
+    normalized_name = _normalize_device_name(device_name)
+    machine_id, device_id = _resolve_machine_device_from_name(normalized_name)
+    insight = _build_machine_insight(machine_id, device_id, force_regenerate=bool(regenerate))
+    insight["device_name"] = normalized_name
+    insight.pop("machine_id", None)
+    insight.pop("device_id", None)
+    return insight
 
 
-@router.post("/insights/{machine_id}/{device_id}/regenerate")
-def regenerate_machine_insights(machine_id: str, device_id: str) -> dict[str, Any]:
-    return _build_machine_insight(machine_id, device_id, force_regenerate=True)
+@router.post("/insights/{device_name}/regenerate")
+def regenerate_machine_insights(device_name: str) -> dict[str, Any]:
+    return machine_insights(device_name, regenerate=True)
 
 
-@router.get("/blynk/insights/{machine_id}/{device_id}")
-def blynk_insights(machine_id: str, device_id: str) -> dict[str, Any]:
+@router.get("/blynk/insights/{device_name}")
+def blynk_insights(device_name: str) -> dict[str, Any]:
+    normalized_name = _normalize_device_name(device_name)
+    machine_id, device_id = _resolve_machine_device_from_name(normalized_name)
     insight = _build_machine_insight(machine_id, device_id, force_regenerate=False)
     return {
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": normalized_name,
         "server_timestamp": insight.get("server_timestamp"),
         "status_label": insight.get("status_label"),
         "is_anomaly": insight.get("is_anomaly"),
@@ -1196,64 +1337,47 @@ def blynk_insights(machine_id: str, device_id: str) -> dict[str, Any]:
     }
 
 
-@router.get("/blynk/insights/{machine_id}")
-def blynk_insights_latest_device(machine_id: str) -> dict[str, Any]:
-    latest_device = store.latest_device_for_machine(machine_id)
-    if not latest_device:
-        raise HTTPException(status_code=404, detail=f"Machine '{machine_id}' has no data yet.")
-    return blynk_insights(machine_id, latest_device)
-
-
-@router.get("/stream/{machine_id}/recent")
+@router.get("/stream/recent/{device_name}")
 def recent_stream(
-    machine_id: str,
+    device_name: str,
     seconds: int = Query(default=120, ge=5, le=86400),
     limit: int = Query(default=500, ge=1, le=10000),
-    device_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
+    machine_id, device_id = _resolve_machine_device_from_name(device_name)
     samples = store.get_recent_samples(machine_id, device_id=device_id, seconds=seconds, limit=limit)
     return {
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": _normalize_device_name(device_name),
         "seconds": seconds,
         "count": len(samples),
         "samples": samples,
     }
 
 
-@router.get("/anomaly-log/{machine_id}")
+@router.get("/anomaly-log/{device_name}")
 def anomaly_log(
-    machine_id: str,
+    device_name: str,
     hours: int = Query(default=24, ge=1, le=720),
     limit: int = Query(default=200, ge=1, le=1000),
-    device_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
+    machine_id, device_id = _resolve_machine_device_from_name(device_name)
     anomalies = store.get_anomalies(machine_id, device_id=device_id, hours=hours, limit=limit)
     return {
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": _normalize_device_name(device_name),
         "hours": hours,
         "count": len(anomalies),
         "anomalies": anomalies,
     }
 
 
-@router.get("/machines")
-def machines() -> dict[str, list[str]]:
-    return {"machines": store.list_machine_ids()}
-
-
-@router.get("/devices/{machine_id}")
-def devices(machine_id: str) -> dict[str, Any]:
-    return {
-        "machine_id": machine_id,
-        "devices": store.list_devices(machine_id),
-    }
+@router.get("/device-names")
+def device_names(limit: int = Query(default=500, ge=1, le=2000)) -> dict[str, Any]:
+    names = store.list_device_names(limit=limit)
+    return {"count": len(names), "device_names": names}
 
 
 @router.get("/stream-binding", response_model=StreamBindingResponse)
 def get_stream_binding() -> StreamBindingResponse:
-    binding = store.get_stream_binding()
+    binding = _binding_with_device_name(store.get_stream_binding())
     if not binding:
         return StreamBindingResponse(binding_name="primary", is_active=False)
     return StreamBindingResponse(**binding)
@@ -1261,85 +1385,109 @@ def get_stream_binding() -> StreamBindingResponse:
 
 @router.post("/stream-binding", response_model=StreamBindingResponse)
 def upsert_stream_binding(payload: StreamBindingUpsertRequest) -> StreamBindingResponse:
-    profile = store.get_device_profile(payload.machine_id, payload.device_id)
+    profile = None
+    if payload.device_name:
+        profile = store.get_device_profile_by_name(payload.device_name)
+    elif payload.machine_id and payload.device_id:
+        profile = store.get_device_profile(payload.machine_id, payload.device_id)
+
     if not profile:
         raise HTTPException(
             status_code=404,
-            detail=(
-                "Cannot bind stream: profile not found for "
-                f"machine '{payload.machine_id}', device '{payload.device_id}'."
-            ),
+            detail="Cannot bind stream: profile not found for provided device_name.",
         )
 
     binding = store.set_stream_binding(
-        machine_id=payload.machine_id,
-        device_id=payload.device_id,
+        machine_id=str(profile["machine_id"]),
+        device_id=str(profile["device_id"]),
         source=payload.source,
     )
-    return StreamBindingResponse(**binding)
+    return StreamBindingResponse(**(_binding_with_device_name(binding) or binding))
 
 
 @router.delete("/stream-binding", response_model=StreamBindingResponse)
 def clear_stream_binding(source: str = Query(default="dashboard_manual")) -> StreamBindingResponse:
     binding = store.clear_stream_binding(source=source)
-    return StreamBindingResponse(**binding)
+    return StreamBindingResponse(**(_binding_with_device_name(binding) or binding))
 
 
 @router.post("/device-profiles", response_model=DeviceProfileResponse)
 def upsert_device_profile(payload: DeviceProfileUpsertRequest) -> DeviceProfileResponse:
-    profile = store.upsert_device_profile(payload.model_dump())
+    device_name = _normalize_device_name(payload.device_name or payload.display_name)
+    if not device_name:
+        raise HTTPException(status_code=400, detail="device_name is required")
+
+    existing = store.get_device_profile_by_name(device_name)
+    if existing:
+        machine_id = str(existing["machine_id"])
+        device_id = str(existing["device_id"])
+    elif payload.machine_id and payload.device_id:
+        machine_id = payload.machine_id
+        device_id = payload.device_id
+    else:
+        machine_id, device_id = _build_profile_ids_for_name(device_name)
+
+    upsert_payload = payload.model_dump()
+    upsert_payload["machine_id"] = machine_id
+    upsert_payload["device_id"] = device_id
+    upsert_payload["display_name"] = device_name
+
+    profile = store.upsert_device_profile(upsert_payload)
     if not profile:
         raise HTTPException(status_code=500, detail="Failed to save device profile.")
-    return DeviceProfileResponse(**profile)
+    return _profile_response(profile)
 
 
-@router.get("/device-profiles/{machine_id}/{device_id}", response_model=DeviceProfileResponse)
-def get_device_profile(machine_id: str, device_id: str) -> DeviceProfileResponse:
-    profile = store.get_device_profile(machine_id, device_id)
+@router.get("/device-profiles/{device_name}", response_model=DeviceProfileResponse)
+def get_device_profile(device_name: str) -> DeviceProfileResponse:
+    profile = store.get_device_profile_by_name(device_name)
     if not profile:
         raise HTTPException(
             status_code=404,
-            detail=f"Device profile not found for machine '{machine_id}', device '{device_id}'.",
+            detail=f"Device profile '{device_name}' not found.",
         )
-    return DeviceProfileResponse(**profile)
+    return _profile_response(profile)
 
 
 @router.get("/device-profiles")
 def list_device_profiles(
-    machine_id: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, Any]:
-    profiles = store.list_device_profiles(machine_id=machine_id, limit=limit)
+    profiles = store.list_device_profiles(machine_id=None, limit=limit)
     return {
-        "machine_id": machine_id,
         "count": len(profiles),
-        "profiles": [DeviceProfileResponse(**profile).model_dump() for profile in profiles],
+        "profiles": [_profile_response(profile).model_dump() for profile in profiles],
     }
 
 
-@router.delete("/device-profiles/{machine_id}/{device_id}")
-def delete_device_profile(machine_id: str, device_id: str) -> dict[str, Any]:
-    deleted = store.delete_device_profile(machine_id, device_id)
-    if not deleted:
+@router.delete("/device-profiles/{device_name}")
+def delete_device_profile(device_name: str) -> dict[str, Any]:
+    deleted_profile = store.delete_device_profile_by_name(device_name)
+    if not deleted_profile:
         raise HTTPException(
             status_code=404,
-            detail=f"Device profile not found for machine '{machine_id}', device '{device_id}'.",
+            detail=f"Device profile '{device_name}' not found.",
         )
 
     return {
         "status": "deleted",
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": _normalize_device_name(device_name),
     }
 
 
 @router.get("/debug/logs")
 def debug_logs(
-    machine_id: str | None = Query(default=None),
-    device_id: str | None = Query(default=None),
+    device_name: str | None = Query(default=None),
     endpoint: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=1000),
 ) -> dict[str, Any]:
+    machine_id = None
+    device_id = None
+    normalized_name = None
+    if device_name:
+        normalized_name = _normalize_device_name(device_name)
+        machine_id, device_id = _resolve_machine_device_from_name(normalized_name)
+
     logs = store.list_api_debug_logs(
         machine_id=machine_id,
         device_id=device_id,
@@ -1347,8 +1495,7 @@ def debug_logs(
         limit=limit,
     )
     return {
-        "machine_id": machine_id,
-        "device_id": device_id,
+        "device_name": normalized_name,
         "endpoint": endpoint,
         "count": len(logs),
         "logs": [ApiDebugLogEntry(**item).model_dump() for item in logs],
@@ -1359,12 +1506,18 @@ def debug_logs(
 async def ws_live(websocket: WebSocket) -> None:
     await websocket.accept()
 
-    initial_binding = get_active_stream_binding()
-    default_machine_id = str(initial_binding["machine_id"]) if initial_binding else UNASSIGNED_MACHINE_ID
-    default_device_id = str(initial_binding["device_id"]) if initial_binding else None
+    initial_binding = _binding_with_device_name(get_active_stream_binding())
+    default_device_name = str((initial_binding or {}).get("device_name") or "").strip() or None
 
-    machine_id = websocket.query_params.get("machine_id") or default_machine_id
-    device_id = websocket.query_params.get("device_id") or default_device_id
+    device_name = websocket.query_params.get("device_name") or default_device_name
+    machine_id = None
+    device_id = None
+    if device_name:
+        profile = store.get_device_profile_by_name(device_name)
+        if profile:
+            machine_id = str(profile["machine_id"])
+            device_id = str(profile["device_id"])
+
     lookback_seconds = _bounded_int(
         websocket.query_params.get("lookback_seconds"),
         default=120,
@@ -1382,8 +1535,7 @@ async def ws_live(websocket: WebSocket) -> None:
     await websocket.send_json(
         {
             "type": "connected",
-            "machine_id": machine_id,
-            "device_id": device_id,
+            "device_name": device_name,
             "active_stream_binding": StreamBindingResponse(**initial_binding).model_dump() if initial_binding else None,
             "server_timestamp": utc_iso_now(),
         }
@@ -1399,8 +1551,12 @@ async def ws_live(websocket: WebSocket) -> None:
                     payload = {}
 
                 if payload.get("type") == "subscribe":
-                    machine_id = payload.get("machine_id") or machine_id
-                    device_id = payload.get("device_id") or device_id
+                    device_name = payload.get("device_name") or device_name
+                    if device_name:
+                        profile = store.get_device_profile_by_name(device_name)
+                        if profile:
+                            machine_id = str(profile["machine_id"])
+                            device_id = str(profile["device_id"])
                     lookback_seconds = _bounded_int(
                         payload.get("lookback_seconds"),
                         default=lookback_seconds,
@@ -1423,9 +1579,6 @@ async def ws_live(websocket: WebSocket) -> None:
         except WebSocketDisconnect:
             break
 
-        if machine_id and not device_id:
-            device_id = store.latest_device_for_machine(machine_id)
-
         new_logs = store.list_api_debug_logs_since(
             after_id=last_log_id,
             machine_id=machine_id,
@@ -1436,7 +1589,7 @@ async def ws_live(websocket: WebSocket) -> None:
             last_log_id = max(last_log_id, int(new_logs[-1].get("id", last_log_id)))
 
         latest_sample = None
-        if machine_id:
+        if machine_id and device_id:
             samples = store.get_recent_samples(
                 machine_id,
                 device_id=device_id,
@@ -1452,21 +1605,17 @@ async def ws_live(websocket: WebSocket) -> None:
 
         status_payload = None
         try:
-            if machine_id and device_id:
-                status_payload = get_status_for_device(machine_id, device_id)
-            elif machine_id:
-                status_payload = get_status(machine_id)
-                device_id = status_payload.get("device_id") or device_id
+            if device_name:
+                status_payload = get_status(device_name)
         except HTTPException:
             status_payload = None
 
-        active_binding = get_active_stream_binding()
+        active_binding = _binding_with_device_name(get_active_stream_binding())
 
         await websocket.send_json(
             {
                 "type": "snapshot",
-                "machine_id": machine_id,
-                "device_id": device_id,
+                "device_name": device_name,
                 "server_timestamp": utc_iso_now(),
                 "latest_sample": latest_sample,
                 "status": status_payload,
