@@ -9,9 +9,11 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import requests
+from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -39,6 +41,9 @@ from backend.models import (
 )
 from backend.debug_dashboard import get_debug_dashboard_html
 from backend.storage import DataStore
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(ROOT_DIR / ".env")
 
 DB_PATH = os.getenv("MACHINOCARE_DB", "data/machinocare.db")
 DATABASE_URL = os.getenv("DATABASE_URL")
