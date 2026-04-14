@@ -16,10 +16,12 @@
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>
+#include <Preferences.h>  
 #include <BlynkSimpleEsp32.h>
 #include <ThingSpeak.h>
-#include <WebSocketsClient.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+#include "esp_system.h"
 #include "time.h"
 
 // WiFi and cloud credentials
@@ -65,7 +67,6 @@ MPU6050 mpu;
 BlynkTimer timer;
 Preferences prefs;
 WiFiClientSecure apiClient;
-WebSocketsClient streamWebSocket;
 
 float accMag = 0;
 float gyroMag = 0;
@@ -88,6 +89,15 @@ unsigned long sw420DebugCooldownUntilMs = 0;
 
 const unsigned long SW420_DEBOUNCE_MS = 150;
 const unsigned long SW420_DEBUG_COOLDOWN_MS = 4000;
+const int SW420_FILTER_WINDOW = 7;
+const int SW420_FILTER_ACTIVE_MIN = 5;
+const bool SW420_USE_INTERRUPT = false;
+
+int sw420IdleLevel = HIGH;
+bool sw420PolarityCalibrated = false;
+uint8_t sw420RecentActive[SW420_FILTER_WINDOW] = {0};
+int sw420RecentPos = 0;
+int sw420RecentCount = 0;
 
 // NEW SW420 frame-threshold logic state
 unsigned long sw420HighAccumulatedMs = 0;
@@ -105,16 +115,41 @@ bool sw420FailBuzzerActive = false;
 const unsigned long SW420_FAIL_BUZZ_MS = 5000;
 
 // Indicator control state
-bool motorOn = true;
-bool fanOn = true;
+bool motorOn = false;
+bool fanOn = false;
 bool buzzerManualOn = false;
 bool ledManualOn = false;
+bool productionRelayCutoffApplied = false;
 
 // Anomaly alert behavior: LED OFF + buzzer pulse for 5s
 bool anomalyAlertActive = false;
 unsigned long anomalyAlertStartMs = 0;
 const unsigned long ANOMALY_ALERT_DURATION_MS = 5000;
 const unsigned long ANOMALY_BUZZER_PULSE_MS = 220;
+
+// Alert source mode (Blynk V28): 0 = SW420 basic, 1 = MPU deviation, 2 = backend ML
+const int ALERT_MODE_SW420 = 0;
+const int ALERT_MODE_MPU = 1;
+const int ALERT_MODE_BACKEND = 2;
+int alertMode = ALERT_MODE_SW420;
+
+// Mode 2 (MPU deviation) parameters
+const float MPU_BASELINE_ACC_MAG = 16500.0;
+const float MPU_BASELINE_GYRO_MAG = 300.0;
+float mpuAccDeviationThreshold = 1200.0;   // V24
+float mpuGyroDeviationThreshold = 120.0;   // V25
+const int MPU_DEVIATION_MIN_CONSECUTIVE = 3;
+int mpuDeviationStreak = 0;
+bool mpuDeviationActive = false;
+float mpuLastAccDeviation = 0.0;
+float mpuLastGyroDeviation = 0.0;
+
+// Mode 3 (backend ML) state
+bool backendAnomalyActive = false;
+float backendLastScore = 0.0;
+float backendLastThreshold = 0.0;
+bool backendHasScore = false;
+bool backendHasThreshold = false;
 
 // ThingSpeak window stats
 float accSum = 0;
@@ -150,13 +185,6 @@ unsigned long streamSuccessCount = 0;
 unsigned long streamFailCount = 0;
 int lastStreamHttpCode = 0;
 String lastStreamResult = "INIT";
-String wsHost = "";
-String wsPath = "";
-uint16_t wsPort = 0;
-bool wsUseTls = true;
-bool wsConfigured = false;
-bool wsConnected = false;
-unsigned long lastWsConnectAttemptMs = 0;
 
 unsigned long lastWiFiReconnectAttemptMs = 0;
 unsigned long lastBlynkConnectAttemptMs = 0;
@@ -165,11 +193,14 @@ unsigned long lastBindingRefreshMs = 0;
 const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long BLYNK_RECONNECT_INTERVAL_MS = 5000;
 const unsigned long BINDING_REFRESH_INTERVAL_MS = 30000;
-const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
-const unsigned long WS_ACK_TIMEOUT_MS = 6000;
+const int STREAM_TARGET_SAMPLE_HZ = 4;
+const unsigned long STREAM_SAMPLE_INTERVAL_MS = 250;
+const unsigned long STREAM_FLUSH_INTERVAL_MS = 8000;
+const int STREAM_HIGH_WATERMARK = 80;
+const unsigned long STREAM_TASK_SLEEP_MS = 20;
 
-const int STREAM_BATCH_SIZE = 5;
-const int STREAM_QUEUE_CAPACITY = 30;
+const int STREAM_BATCH_SIZE = 32;
+const int STREAM_QUEUE_CAPACITY = 120;
 
 // Feature window
 const int WINDOW_SIZE = 10;
@@ -181,7 +212,7 @@ float gzWindow[WINDOW_SIZE] = {0};
 int windowPos = 0;
 int windowCount = 0;
 
-const int STREAM_HTTP_TIMEOUT_MS = 3500;
+const int STREAM_HTTP_TIMEOUT_MS = 1500;
 const int MODEL_HTTP_TIMEOUT_MS = 5000;
 
 struct StreamQueuedSample {
@@ -199,22 +230,105 @@ StreamQueuedSample streamQueue[STREAM_QUEUE_CAPACITY];
 int streamQueueHead = 0;
 int streamQueueCount = 0;
 int streamNextSequence = 1;
-bool streamInFlight = false;
-int streamInFlightCount = 0;
-unsigned long streamInFlightSentAtMs = 0;
 unsigned long streamDroppedCount = 0;
+SemaphoreHandle_t streamStateMutex = nullptr;
+TaskHandle_t streamUploaderTaskHandle = nullptr;
 
 // -------------------- Helpers --------------------
 
 void updateAlertOutputs();
-void onStreamWsEvent(WStype_t type, uint8_t* payload, size_t length);
+void calibrateSw420Polarity();
+void updateSw420FilterSample();
+bool isSw420ActiveFiltered();
+bool isSw420AlertMode();
+bool isMpuAlertMode();
+bool isBackendAlertMode();
+const char* alertModeLabel();
+bool evaluateMpuDeviationMode();
+bool currentModeFailureActive();
+String buildModeStatusLine();
+void pushModeTelemetryToBlynk();
+void streamUploaderTask(void* parameter);
+void setStreamStatus(int httpCode, const String& result, bool markSuccess, bool markFail);
+void incrementStreamAttemptCount();
+void clearLocalModelForProfileChange(const char* reason);
 
 void applyIndicators() {
   updateAlertOutputs();
 }
 
+bool isSw420AlertMode() {
+  return alertMode == ALERT_MODE_SW420;
+}
+
+bool isMpuAlertMode() {
+  return alertMode == ALERT_MODE_MPU;
+}
+
+bool isBackendAlertMode() {
+  return alertMode == ALERT_MODE_BACKEND;
+}
+
+const char* alertModeLabel() {
+  if (isMpuAlertMode()) return "MPU";
+  if (isBackendAlertMode()) return "BACKEND";
+  return "SW420";
+}
+
+bool currentModeFailureActive() {
+  unsigned long now = millis();
+  bool sw420Muted = sw420DebugCooldownActive && debugMode && now < sw420DebugCooldownUntilMs;
+
+  if (isSw420AlertMode()) {
+    return sw420FaultLatched || sw420Muted;
+  }
+  if (isMpuAlertMode()) {
+    return mpuDeviationActive;
+  }
+  return backendAnomalyActive;
+}
+
+String buildModeStatusLine() {
+  bool modeFail = currentModeFailureActive();
+
+  if (isSw420AlertMode()) {
+    return "M1 SW420 | fail=" + String(modeFail ? 1 : 0) +
+      " high=" + String(sw420HighAccumulatedMs / 1000.0, 1) +
+      "s th=" + String(sw420ThresholdSec) +
+      "s frame=" + String(sw420FrameSec) + "s";
+  }
+
+  if (isMpuAlertMode()) {
+    return "M2 MPU | fail=" + String(modeFail ? 1 : 0) +
+      " dAcc=" + String(mpuLastAccDeviation, 0) +
+      " dGy=" + String(mpuLastGyroDeviation, 0);
+  }
+
+  String scoreText = backendHasScore ? String(backendLastScore, 3) : "na";
+  String thresholdText = backendHasThreshold ? String(backendLastThreshold, 3) : "na";
+  return "M3 BACKEND | fail=" + String(modeFail ? 1 : 0) +
+    " score=" + scoreText +
+    " th=" + thresholdText;
+}
+
+void pushModeTelemetryToBlynk() {
+  Blynk.virtualWrite(V29, alertMode);
+  if (isSw420AlertMode()) {
+    Blynk.virtualWrite(V30, sw420HighAccumulatedMs / 1000.0);
+    Blynk.virtualWrite(V31, (float)sw420ThresholdSec);
+  } else if (isMpuAlertMode()) {
+    Blynk.virtualWrite(V30, mpuLastAccDeviation);
+    Blynk.virtualWrite(V31, mpuLastGyroDeviation);
+  } else {
+    Blynk.virtualWrite(V30, backendHasScore ? backendLastScore : -1.0);
+    Blynk.virtualWrite(V31, backendHasThreshold ? backendLastThreshold : -1.0);
+  }
+  Blynk.virtualWrite(V26, buildModeStatusLine());
+}
+
 void updateAlertOutputs() {
   unsigned long now = millis();
+  bool modeFail = currentModeFailureActive();
 
   if (sw420DebugCooldownActive && debugMode && now >= sw420DebugCooldownUntilMs) {
     sw420DebugCooldownActive = false;
@@ -225,26 +339,44 @@ void updateAlertOutputs() {
     anomalyAlertActive = false;
   }
 
+  bool sw420SafetyEnabled = isSw420AlertMode();
+  bool advancedAlertEnabled = isMpuAlertMode() || isBackendAlertMode();
   bool sw420Muted = sw420DebugCooldownActive && debugMode && now < sw420DebugCooldownUntilMs;
+
+  // Production mode: apply relay shutdown once per fault episode, never reboot ESP.
+  if (!debugMode) {
+    bool sw420GraceActive = isSw420AlertMode() && sw420FailBuzzerActive && ((now - sw420FailBuzzerStartMs) < SW420_FAIL_BUZZ_MS);
+    if (modeFail && !sw420GraceActive && !productionRelayCutoffApplied) {
+      motorOn = false;
+      fanOn = false;
+      productionRelayCutoffApplied = true;
+      Serial.print("RELAY_CUTOFF_APPLIED,mode=");
+      Serial.println(alertModeLabel());
+    } else if (!modeFail) {
+      productionRelayCutoffApplied = false;
+    }
+  } else {
+    productionRelayCutoffApplied = false;
+  }
 
   // Normal state: LED ON, buzzer OFF
   bool ledState = true;
   bool buzzerState = false;
 
   // Anomaly state: LED OFF + buzzer pulse
-  if (anomalyAlertActive) {
+  if (advancedAlertEnabled && anomalyAlertActive) {
     ledState = false;
     buzzerState = ((now / ANOMALY_BUZZER_PULSE_MS) % 2) == 0;
   }
 
   // Manual controls only when no anomaly and no SW420 block
-  if (!anomalyAlertActive && !sw420FaultLatched && !sw420Muted) {
+  if ((!anomalyAlertActive || !advancedAlertEnabled) && (!sw420SafetyEnabled || (!sw420FaultLatched && !sw420Muted))) {
     ledState = ledState || ledManualOn;
     buzzerState = buzzerManualOn;
   }
 
   // SW420 safety highest priority
-  if (sw420FaultLatched || sw420Muted) {
+  if (sw420SafetyEnabled && (sw420FaultLatched || sw420Muted)) {
     ledState = false;
 
     // Buzzer ON for first 5s after SW420 fail
@@ -253,12 +385,6 @@ void updateAlertOutputs() {
     } else {
       sw420FailBuzzerActive = false;
       buzzerState = false;
-
-      // After 5s, shutdown only in production mode
-      if (!debugMode && sw420FaultLatched) {
-        motorOn = false;
-        fanOn = false;
-      }
     }
   }
 
@@ -293,6 +419,10 @@ void resetRuntimeForFreshCalibration() {
   sampleCount = 0;
   anomalyStreak = 0;
   isMachineFailing = false;
+  mpuDeviationStreak = 0;
+  mpuDeviationActive = false;
+  backendAnomalyActive = false;
+  anomalyAlertActive = false;
 
   for (int i = 0; i < WINDOW_SIZE; i++) {
     accWindow[i] = 0;
@@ -309,6 +439,78 @@ void resetRuntimeForFreshCalibration() {
 
 void IRAM_ATTR emergencyKillSwitch() {
   sw420InterruptPending = true;
+}
+
+void calibrateSw420Polarity() {
+  int highCount = 0;
+  int lowCount = 0;
+  const int sampleCountForCal = 120;
+
+  for (int i = 0; i < sampleCountForCal; i++) {
+    int raw = digitalRead(SW420_PIN);
+    if (raw == HIGH) highCount++;
+    else lowCount++;
+    delay(2);
+  }
+
+  sw420IdleLevel = (highCount >= lowCount) ? HIGH : LOW;
+  sw420PolarityCalibrated = true;
+
+  for (int i = 0; i < SW420_FILTER_WINDOW; i++) {
+    sw420RecentActive[i] = 0;
+  }
+  sw420RecentPos = 0;
+  sw420RecentCount = 0;
+
+  Serial.print("SW420_POLARITY,idle=");
+  Serial.print(sw420IdleLevel == HIGH ? "HIGH" : "LOW");
+  Serial.print(",high_samples=");
+  Serial.print(highCount);
+  Serial.print(",low_samples=");
+  Serial.println(lowCount);
+}
+
+void updateSw420FilterSample() {
+  int raw = digitalRead(SW420_PIN);
+  uint8_t active = (raw != sw420IdleLevel) ? 1 : 0;
+  sw420RecentActive[sw420RecentPos] = active;
+  sw420RecentPos = (sw420RecentPos + 1) % SW420_FILTER_WINDOW;
+  if (sw420RecentCount < SW420_FILTER_WINDOW) sw420RecentCount++;
+}
+
+bool isSw420ActiveFiltered() {
+  if (!sw420PolarityCalibrated) return false;
+  if (sw420RecentCount <= 0) return false;
+
+  int activeCount = 0;
+  for (int i = 0; i < sw420RecentCount; i++) {
+    activeCount += sw420RecentActive[i];
+  }
+
+  int required = SW420_FILTER_ACTIVE_MIN;
+  if (sw420RecentCount < SW420_FILTER_WINDOW) {
+    required = (sw420RecentCount * 2 + 2) / 3; // around 67% active while buffer is warming up
+    if (required < 1) required = 1;
+  }
+  return activeCount >= required;
+}
+
+bool evaluateMpuDeviationMode() {
+  mpuLastAccDeviation = fabs(accMag - MPU_BASELINE_ACC_MAG);
+  mpuLastGyroDeviation = fabs(gyroMag - MPU_BASELINE_GYRO_MAG);
+
+  bool instantDeviation =
+    (mpuLastAccDeviation >= mpuAccDeviationThreshold) &&
+    (mpuLastGyroDeviation >= mpuGyroDeviationThreshold);
+
+  if (instantDeviation) {
+    if (mpuDeviationStreak < 10000) mpuDeviationStreak++;
+  } else {
+    mpuDeviationStreak = 0;
+  }
+
+  mpuDeviationActive = (mpuDeviationStreak >= MPU_DEVIATION_MIN_CONSECUTIVE);
+  return mpuDeviationActive;
 }
 
 void evaluateSw420FrameLogic() {
@@ -336,7 +538,7 @@ void evaluateSw420FrameLogic() {
   unsigned long thresholdMs = (unsigned long)sw420ThresholdSec * 1000UL;
 
   // Accumulate HIGH duration, capped to frame
-  if (digitalRead(SW420_PIN) == HIGH) {
+  if (isSw420ActiveFiltered()) {
     if (sw420HighAccumulatedMs + dt >= frameMs) sw420HighAccumulatedMs = frameMs;
     else sw420HighAccumulatedMs += dt;
   }
@@ -348,31 +550,36 @@ void evaluateSw420FrameLogic() {
     sw420FrameFail = (sw420HighAccumulatedMs >= thresholdMs);
 
     if (sw420FrameFail) {
-      // start 5s buzzer window
-      sw420FailBuzzerActive = true;
-      sw420FailBuzzerStartMs = millis();
+      if (isSw420AlertMode()) {
+        // start 5s buzzer window
+        sw420FailBuzzerActive = true;
+        sw420FailBuzzerStartMs = millis();
 
-      if (debugMode) {
-        sw420DebugCooldownActive = true;
-        sw420DebugCooldownUntilMs = now + SW420_DEBUG_COOLDOWN_MS;
-        sw420FaultLatched = false;
-        emergencyTriggered = false;
-        sw420FaultAnnounced = false;
-        Serial.println("SW420 FRAME FAIL (debug mute active)");
+        if (debugMode) {
+          sw420DebugCooldownActive = true;
+          sw420DebugCooldownUntilMs = now + SW420_DEBUG_COOLDOWN_MS;
+          sw420FaultLatched = false;
+          emergencyTriggered = false;
+          sw420FaultAnnounced = false;
+          Serial.println("SW420 FRAME FAIL (debug mute active)");
+        } else {
+          sw420FaultLatched = true;
+          sw420FaultAnnounced = false;
+          emergencyTriggered = true;
+        }
       } else {
-        sw420FaultLatched = true;
-        sw420FaultAnnounced = false;
-        emergencyTriggered = true;
+        Serial.print("SW420_FRAME_FAIL_IGNORED,mode=");
+        Serial.println(alertModeLabel());
       }
 
-      if (Blynk.connected()) {
+      if (Blynk.connected() && isSw420AlertMode()) {
         Blynk.virtualWrite(V26,
           "FAIL | HIGH=" + String(sw420HighAccumulatedMs / 1000.0, 1) +
           "s / FRAME=" + String(sw420FrameSec) +
           "s | TH=" + String(sw420ThresholdSec) + "s");
       }
     } else {
-      if (Blynk.connected()) {
+      if (Blynk.connected() && isSw420AlertMode()) {
         Blynk.virtualWrite(V26,
           "PASS | HIGH=" + String(sw420HighAccumulatedMs / 1000.0, 1) +
           "s / FRAME=" + String(sw420FrameSec) +
@@ -401,15 +608,19 @@ void evaluateSw420FrameLogic() {
 void processSw420Trigger() {
   bool pending = false;
 
-  noInterrupts();
-  pending = sw420InterruptPending;
-  sw420InterruptPending = false;
-  interrupts();
+  updateSw420FilterSample();
 
-  if (pending) {
-    unsigned long now = millis();
-    if (now - sw420LastConfirmedTriggerMs >= SW420_DEBOUNCE_MS) {
-      sw420LastConfirmedTriggerMs = now;
+  if (SW420_USE_INTERRUPT) {
+    noInterrupts();
+    pending = sw420InterruptPending;
+    sw420InterruptPending = false;
+    interrupts();
+
+    if (pending) {
+      unsigned long now = millis();
+      if (now - sw420LastConfirmedTriggerMs >= SW420_DEBOUNCE_MS) {
+        sw420LastConfirmedTriggerMs = now;
+      }
     }
   }
 
@@ -549,7 +760,61 @@ bool evaluateLocalAI() {
   return anomaly;
 }
 
-bool httpPostJson(const String& url, const String& payload, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr) {
+void setStreamStatus(int httpCode, const String& result, bool markSuccess, bool markFail) {
+  if (streamStateMutex && xSemaphoreTake(streamStateMutex, pdMS_TO_TICKS(40)) == pdTRUE) {
+    if (markSuccess) streamSuccessCount++;
+    if (markFail) streamFailCount++;
+    lastStreamHttpCode = httpCode;
+    lastStreamResult = result;
+    xSemaphoreGive(streamStateMutex);
+    return;
+  }
+
+  if (markSuccess) streamSuccessCount++;
+  if (markFail) streamFailCount++;
+  lastStreamHttpCode = httpCode;
+  lastStreamResult = result;
+}
+
+void incrementStreamAttemptCount() {
+  if (streamStateMutex && xSemaphoreTake(streamStateMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    streamAttemptCount++;
+    xSemaphoreGive(streamStateMutex);
+    return;
+  }
+  streamAttemptCount++;
+}
+
+void clearLocalModelForProfileChange(const char* reason) {
+  modelReady = false;
+  modelVersion = 0;
+  modelChecksum = "";
+  modelBias = 0.0;
+  modelDecisionThreshold = 0.55;
+  modelHysteresisHigh = 0.55;
+  modelHysteresisLow = 0.48;
+  modelMinConsecutiveWindows = 3;
+  aiThreshold = 25000.0;
+  anomalyStreak = 0;
+
+  for (int i = 0; i < FEATURE_DIM; i++) {
+    featureMeans[i] = 0.0;
+    featureStds[i] = 1.0;
+    modelWeights[i] = 0.0;
+  }
+
+  saveModelToNvs();
+
+  Serial.print("MODEL_LOCAL_CLEARED,reason=");
+  Serial.println(reason ? reason : "unknown");
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V9, modelVersion);
+    Blynk.virtualWrite(V26, "Model cleared for profile switch");
+  }
+}
+
+bool httpPostJson(const String& url, const String& payload, String& responseOut, int timeoutMs, int* statusCodeOut = nullptr, int maxAttempts = 2) {
   if (!backendEnabled) {
     if (statusCodeOut) *statusCodeOut = -1;
     return false;
@@ -563,7 +828,8 @@ bool httpPostJson(const String& url, const String& payload, String& responseOut,
     }
   }
 
-  for (int attempt = 0; attempt < 2; attempt++) {
+  if (maxAttempts < 1) maxAttempts = 1;
+  for (int attempt = 0; attempt < maxAttempts; attempt++) {
     HTTPClient http;
     bool beginOk = false;
     if (url.startsWith("https://")) {
@@ -651,76 +917,6 @@ bool httpGetJson(const String& url, String& responseOut, int timeoutMs, int* sta
   return false;
 }
 
-bool parseBackendBaseForWs(const String& baseUrl, String& hostOut, uint16_t& portOut, String& pathOut, bool& useTlsOut) {
-  String url = baseUrl;
-  url.trim();
-  if (url.length() == 0) return false;
-
-  bool isTls = true;
-  int schemeEnd = url.indexOf("://");
-  if (schemeEnd >= 0) {
-    String scheme = url.substring(0, schemeEnd);
-    scheme.toLowerCase();
-    if (scheme == "http") isTls = false;
-    else if (scheme == "https") isTls = true;
-    else return false;
-    url = url.substring(schemeEnd + 3);
-  }
-
-  int slashPos = url.indexOf('/');
-  String hostPort = (slashPos >= 0) ? url.substring(0, slashPos) : url;
-  String basePath = (slashPos >= 0) ? url.substring(slashPos) : "";
-  if (hostPort.length() == 0) return false;
-
-  int colonPos = hostPort.indexOf(':');
-  String host = hostPort;
-  uint16_t port = isTls ? 443 : 80;
-  if (colonPos >= 0) {
-    host = hostPort.substring(0, colonPos);
-    String portStr = hostPort.substring(colonPos + 1);
-    int parsed = portStr.toInt();
-    if (parsed <= 0 || parsed > 65535) return false;
-    port = (uint16_t)parsed;
-  }
-  if (host.length() == 0) return false;
-
-  String wsPathLocal = basePath;
-  if (!wsPathLocal.startsWith("/")) wsPathLocal = "/" + wsPathLocal;
-  if (wsPathLocal.endsWith("/")) wsPathLocal.remove(wsPathLocal.length() - 1);
-  if (wsPathLocal == "/") wsPathLocal = "";
-  wsPathLocal += "/api/v1/ws/stream";
-
-  hostOut = host;
-  portOut = port;
-  pathOut = wsPathLocal;
-  useTlsOut = isTls;
-  return true;
-}
-
-void configureStreamWebSocket() {
-  wsConfigured = parseBackendBaseForWs(BACKEND_BASE_URL, wsHost, wsPort, wsPath, wsUseTls);
-  if (!wsConfigured) {
-    Serial.println("WS_CONFIG_FAIL: invalid BACKEND_BASE_URL");
-    return;
-  }
-
-  streamWebSocket.onEvent(onStreamWsEvent);
-  if (wsUseTls) {
-    streamWebSocket.beginSSL(wsHost.c_str(), wsPort, wsPath.c_str());
-  } else {
-    streamWebSocket.begin(wsHost.c_str(), wsPort, wsPath.c_str());
-  }
-  streamWebSocket.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-  streamWebSocket.enableHeartbeat(15000, 3000, 2);
-
-  Serial.print("WS_CONFIG_OK,host=");
-  Serial.print(wsHost);
-  Serial.print(",port=");
-  Serial.print(wsPort);
-  Serial.print(",path=");
-  Serial.println(wsPath);
-}
-
 int streamQueueIndex(int logicalIdx) {
   return (streamQueueHead + logicalIdx) % STREAM_QUEUE_CAPACITY;
 }
@@ -748,7 +944,7 @@ void enqueueCurrentSampleForStream() {
   item.gx = gx;
   item.gy = gy;
   item.gz = gz;
-  item.sw420 = digitalRead(SW420_PIN);
+  item.sw420 = isSw420ActiveFiltered() ? 1 : 0;
   item.sequence = streamNextSequence++;
 
   if (streamQueueCount >= STREAM_QUEUE_CAPACITY) {
@@ -791,124 +987,43 @@ String buildBatchPayload(int maxSamples, int& outBatchCount) {
   return payload;
 }
 
-void handleStreamAckPayload(const String& message) {
-  DynamicJsonDocument doc(4096);
-  if (deserializeJson(doc, message) != DeserializationError::Ok) {
-    return;
-  }
-
-  String type = String((const char*)(doc["type"] | ""));
-  if (type == "ack") {
-    int received = doc["received_samples"] | streamInFlightCount;
-    if (received <= 0) received = streamInFlightCount;
-    if (streamInFlight) {
-      popStreamQueue(received);
-      streamInFlight = false;
-      streamInFlightCount = 0;
-      streamSuccessCount++;
-      lastStreamHttpCode = 101;
-      lastStreamResult = "OK:WS_ACK";
-    }
-    if (doc.containsKey("is_anomaly") && doc["is_anomaly"].as<bool>()) {
-      isMachineFailing = true;
-    }
-    return;
-  }
-
-  if (type == "error") {
-    int statusCode = doc["status_code"] | -104;
-    String detail = String((const char*)(doc["detail"] | "ws_error"));
-    streamInFlight = false;
-    streamInFlightCount = 0;
-    streamFailCount++;
-    lastStreamHttpCode = statusCode;
-    lastStreamResult = "FAIL:WS_" + String(statusCode);
-    Serial.print("WS_STREAM_ERROR,");
-    Serial.println(detail);
-    return;
-  }
-
-  if (type == "connected") {
-    lastStreamHttpCode = 101;
-    lastStreamResult = "WS_READY";
-  }
-}
-
-void onStreamWsEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      wsConnected = true;
-      lastStreamHttpCode = 101;
-      lastStreamResult = "WS_CONNECTED";
-      Serial.println("WS_CONNECTED");
-      break;
-    case WStype_DISCONNECTED:
-      wsConnected = false;
-      streamInFlight = false;
-      streamInFlightCount = 0;
-      lastStreamResult = "WS_DISCONNECTED";
-      Serial.println("WS_DISCONNECTED");
-      break;
-    case WStype_TEXT: {
-      String msg;
-      msg.reserve(length + 1);
-      for (size_t i = 0; i < length; i++) msg += (char)payload[i];
-      handleStreamAckPayload(msg);
-      break;
-    }
-    default:
-      break;
-  }
-}
-
-void ensureStreamWebSocketConnection() {
-  if (!backendEnabled || !wsConfigured) return;
-  if (wsConnected) return;
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  unsigned long now = millis();
-  if (now - lastWsConnectAttemptMs < WS_RECONNECT_INTERVAL_MS) return;
-  lastWsConnectAttemptMs = now;
-
-  streamWebSocket.disconnect();
-  if (wsUseTls) {
-    streamWebSocket.beginSSL(wsHost.c_str(), wsPort, wsPath.c_str());
-  } else {
-    streamWebSocket.begin(wsHost.c_str(), wsPort, wsPath.c_str());
-  }
-  streamWebSocket.onEvent(onStreamWsEvent);
-  streamWebSocket.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-}
-
-bool sendBatchOverHttpFallback(int batchCount) {
-  if (batchCount <= 0) return false;
-
-  int payloadCount = 0;
-  String payload = buildBatchPayload(batchCount, payloadCount);
+bool sendBatchOverHttpFallback(const String& payload, int payloadCount) {
   if (payloadCount <= 0) return false;
 
   String response;
   int httpCode = 0;
   String url = String(BACKEND_BASE_URL) + "/api/v1/stream";
-  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode)) {
-    streamFailCount++;
-    lastStreamHttpCode = httpCode;
-    if (httpCode == -1) lastStreamResult = "FAIL: WIFI_DOWN";
-    else if (httpCode == -2) lastStreamResult = "FAIL: HTTP_BEGIN";
-    else if (httpCode == -11) lastStreamResult = "FAIL: HTTP_TIMEOUT";
-    else lastStreamResult = "FAIL: HTTP_" + String(httpCode);
+  if (!httpPostJson(url, payload, response, STREAM_HTTP_TIMEOUT_MS, &httpCode, 1)) {
+    if (httpCode == -1) setStreamStatus(httpCode, "FAIL: WIFI_DOWN", false, true);
+    else if (httpCode == -2) setStreamStatus(httpCode, "FAIL: HTTP_BEGIN", false, true);
+    else if (httpCode == -11) setStreamStatus(httpCode, "FAIL: HTTP_TIMEOUT", false, true);
+    else setStreamStatus(httpCode, "FAIL: HTTP_" + String(httpCode), false, true);
     return false;
   }
 
   popStreamQueue(payloadCount);
-  streamSuccessCount++;
-  lastStreamHttpCode = httpCode;
-  lastStreamResult = "OK:HTTP_BATCH";
+  setStreamStatus(httpCode, "OK:HTTP_BATCH", true, false);
 
   DynamicJsonDocument doc(2048);
   if (deserializeJson(doc, response) == DeserializationError::Ok) {
-    if (doc.containsKey("is_anomaly") && doc["is_anomaly"].as<bool>()) {
-      isMachineFailing = true;
+    bool previousBackendAnomaly = backendAnomalyActive;
+
+    if (doc.containsKey("is_anomaly")) {
+      backendAnomalyActive = doc["is_anomaly"].as<bool>();
+    }
+    if (doc.containsKey("score") && !doc["score"].isNull()) {
+      backendLastScore = doc["score"].as<float>();
+      backendHasScore = true;
+    }
+    if (doc.containsKey("decision_threshold") && !doc["decision_threshold"].isNull()) {
+      backendLastThreshold = doc["decision_threshold"].as<float>();
+      backendHasThreshold = true;
+    }
+
+    if (isBackendAlertMode() && backendAnomalyActive && !previousBackendAnomaly) {
+      anomalyAlertActive = true;
+      anomalyAlertStartMs = millis();
+      Blynk.logEvent("machine_alert", "Backend ML anomaly flagged");
     }
   }
   return true;
@@ -940,6 +1055,10 @@ bool refreshActiveBinding(bool force = false) {
 
   bool isActive = doc["is_active"] | false;
   if (!isActive) {
+    bool hadActiveBinding = activeBindingMachineId.length() > 0 || activeBindingDeviceId.length() > 0;
+    if (hadActiveBinding) {
+      clearLocalModelForProfileChange("binding_cleared");
+    }
     activeBindingMachineId = "";
     activeBindingDeviceId = "";
     return false;
@@ -958,10 +1077,15 @@ bool refreshActiveBinding(bool force = false) {
   activeBindingDeviceId = device;
 
   if (changed) {
+    clearLocalModelForProfileChange("binding_changed");
+
     Serial.print("BINDING_ACTIVE,machine=");
     Serial.print(activeBindingMachineId);
     Serial.print(",device=");
     Serial.println(activeBindingDeviceId);
+
+    // Try pulling backend model immediately for the new profile binding.
+    pullModelPackageFromBackend();
   }
 
   return true;
@@ -1074,7 +1198,7 @@ bool startCalibrationJobOnBackend(bool newDeviceSetup, const char* triggerSource
   StaticJsonDocument<768> req;
   req["machine_id"] = activeBindingMachineId;
   req["device_id"] = activeBindingDeviceId;
-  req["sample_rate_hz"] = 1;
+  req["sample_rate_hz"] = STREAM_TARGET_SAMPLE_HZ;
   req["window_seconds"] = 1;
   req["fallback_seconds"] = 300;
   req["contamination"] = 0.05;
@@ -1175,7 +1299,16 @@ void pullModelPackageFromBackend() {
   }
 
   int incomingVersion = pkg["model_version"] | 0;
-  if (incomingVersion < modelVersion) return;
+  String incomingChecksum = String((const char*)(pkg["checksum"] | ""));
+  bool sameChecksum = incomingChecksum.length() > 0 && incomingChecksum == modelChecksum;
+  if (incomingVersion < modelVersion && sameChecksum) return;
+
+  if (incomingVersion < modelVersion && !sameChecksum) {
+    Serial.print("Model version rollback accepted, local=");
+    Serial.print(modelVersion);
+    Serial.print(",incoming=");
+    Serial.println(incomingVersion);
+  }
 
   if (applyModelPackage(pkg)) {
     Serial.print("Model package applied, version=");
@@ -1189,28 +1322,51 @@ void requestCalibrationFromBackend() {
 
 // -------------------- Stream + cloud --------------------
 
+void streamUploaderTask(void* parameter) {
+  unsigned long nextSampleAtMs = millis();
+  unsigned long nextFlushAtMs = millis() + STREAM_FLUSH_INTERVAL_MS;
+
+  for (;;) {
+    if (!backendEnabled || (emergencyTriggered && !debugMode)) {
+      vTaskDelay(pdMS_TO_TICKS(150));
+      continue;
+    }
+
+    unsigned long now = millis();
+
+    int sampleBursts = 0;
+    while ((long)(now - nextSampleAtMs) >= 0 && sampleBursts < 3) {
+      enqueueCurrentSampleForStream();
+      nextSampleAtMs += STREAM_SAMPLE_INTERVAL_MS;
+      sampleBursts++;
+    }
+
+    bool flushDue = (long)(now - nextFlushAtMs) >= 0;
+    bool queuePressured = streamQueueCount >= STREAM_HIGH_WATERMARK;
+    if (flushDue || queuePressured) {
+      sendStreamToBackend();
+      nextFlushAtMs = now + STREAM_FLUSH_INTERVAL_MS;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(STREAM_TASK_SLEEP_MS));
+  }
+}
+
+void enqueueStreamSampleTask() {
+  if (!backendEnabled) return;
+  if (emergencyTriggered && !debugMode) return;
+  enqueueCurrentSampleForStream();
+}
+
 void sendStreamToBackend() {
   if (!backendEnabled) return;
   if (emergencyTriggered && !debugMode) return;
 
-  enqueueCurrentSampleForStream();
-  ensureStreamWebSocketConnection();
-
-  if (streamInFlight && (millis() - streamInFlightSentAtMs > WS_ACK_TIMEOUT_MS)) {
-    streamInFlight = false;
-    streamInFlightCount = 0;
-    streamFailCount++;
-    lastStreamHttpCode = -102;
-    lastStreamResult = "FAIL:WS_ACK_TIMEOUT";
-    wsConnected = false;
-    streamWebSocket.disconnect();
-  }
-
-  if (streamQueueCount <= 0 || streamInFlight) {
+  if (streamQueueCount <= 0) {
     return;
   }
 
-  streamAttemptCount++;
+  incrementStreamAttemptCount();
 
   int batchCount = 0;
   String payload = buildBatchPayload(STREAM_BATCH_SIZE, batchCount);
@@ -1218,44 +1374,39 @@ void sendStreamToBackend() {
     return;
   }
 
-  if (wsConnected) {
-    bool sent = streamWebSocket.sendTXT(payload);
-    if (sent) {
-      streamInFlight = true;
-      streamInFlightCount = batchCount;
-      streamInFlightSentAtMs = millis();
-      lastStreamHttpCode = 101;
-      lastStreamResult = "WS_SENT";
-      return;
-    }
-
-    streamFailCount++;
-    lastStreamHttpCode = -103;
-    lastStreamResult = "FAIL:WS_TX";
-    wsConnected = false;
-    streamWebSocket.disconnect();
-  }
-
-  sendBatchOverHttpFallback(batchCount);
+  sendBatchOverHttpFallback(payload, batchCount);
 }
 
 void reportBackendTelemetry() {
+  unsigned long attempts = streamAttemptCount;
+  unsigned long success = streamSuccessCount;
+  unsigned long fail = streamFailCount;
+  int code = lastStreamHttpCode;
+  String result = lastStreamResult;
+  if (streamStateMutex && xSemaphoreTake(streamStateMutex, pdMS_TO_TICKS(30)) == pdTRUE) {
+    attempts = streamAttemptCount;
+    success = streamSuccessCount;
+    fail = streamFailCount;
+    code = lastStreamHttpCode;
+    result = lastStreamResult;
+    xSemaphoreGive(streamStateMutex);
+  }
+
   Serial.print("STREAM_STATS,attempt=");
-  Serial.print(streamAttemptCount);
+  Serial.print(attempts);
   Serial.print(",success=");
-  Serial.print(streamSuccessCount);
+  Serial.print(success);
   Serial.print(",fail=");
-  Serial.print(streamFailCount);
+  Serial.print(fail);
   Serial.print(",lastCode=");
-  Serial.print(lastStreamHttpCode);
+  Serial.print(code);
   Serial.print(",lastResult=");
-  Serial.print(lastStreamResult);
+  Serial.print(result);
   Serial.print(",queued=");
   Serial.print(streamQueueCount);
   Serial.print(",dropped=");
   Serial.print(streamDroppedCount);
-  Serial.print(",ws=");
-  Serial.println(wsConnected ? "1" : "0");
+  Serial.println(",transport=http");
 }
 
 // -------------------- Blynk handlers --------------------
@@ -1344,13 +1495,86 @@ BLYNK_WRITE(V23) {
   Serial.println(sw420FrameSec);
 }
 
+// V24: MPU accel magnitude deviation threshold
+BLYNK_WRITE(V24) {
+  int v = param.asInt();
+  if (v < 100) v = 100;
+  if (v > 8000) v = 8000;
+  mpuAccDeviationThreshold = (float)v;
+  Blynk.virtualWrite(V24, (int)mpuAccDeviationThreshold);
+
+  Serial.print("MPU_ACC_DEV_TH=");
+  Serial.println(mpuAccDeviationThreshold);
+}
+
+// V25: MPU gyro magnitude deviation threshold
+BLYNK_WRITE(V25) {
+  int v = param.asInt();
+  if (v < 20) v = 20;
+  if (v > 2000) v = 2000;
+  mpuGyroDeviationThreshold = (float)v;
+  Blynk.virtualWrite(V25, (int)mpuGyroDeviationThreshold);
+
+  Serial.print("MPU_GYRO_DEV_TH=");
+  Serial.println(mpuGyroDeviationThreshold);
+}
+
 // V27: debug mode switch (1=debug ON, 0=production OFF)
 BLYNK_WRITE(V27) {
   debugMode = (param.asInt() == 1);
   Blynk.virtualWrite(V27, debugMode ? 1 : 0);
 
+  if (debugMode) {
+    // Leaving production mode: clear latched shutdown state so debug behavior is immediate.
+    emergencyTriggered = false;
+    sw420FaultLatched = false;
+    sw420FaultAnnounced = false;
+    productionRelayCutoffApplied = false;
+  }
+
   Serial.print("DEBUG_MODE=");
   Serial.println(debugMode ? "ON" : "OFF");
+}
+
+// V28: alert source mode (0=SW420 basic, 1=MPU deviation, 2=backend ML)
+BLYNK_WRITE(V28) {
+  int v = param.asInt();
+  if (v < ALERT_MODE_SW420) v = ALERT_MODE_SW420;
+  if (v > ALERT_MODE_BACKEND) v = ALERT_MODE_BACKEND;
+  alertMode = v;
+  Blynk.virtualWrite(V28, alertMode);
+
+  anomalyAlertActive = false;
+
+  // Keep only selected mode state active.
+  if (!isSw420AlertMode()) {
+    sw420FaultLatched = false;
+    sw420DebugCooldownActive = false;
+    sw420FailBuzzerActive = false;
+    sw420FaultAnnounced = false;
+    emergencyTriggered = false;
+  }
+  if (!isMpuAlertMode()) {
+    mpuDeviationStreak = 0;
+    mpuDeviationActive = false;
+  }
+  if (!isBackendAlertMode()) {
+    backendAnomalyActive = false;
+    backendHasScore = false;
+    backendHasThreshold = false;
+  } else if (backendAnomalyActive) {
+    anomalyAlertActive = true;
+    anomalyAlertStartMs = millis();
+  }
+
+  isMachineFailing = currentModeFailureActive();
+
+  Serial.print("ALERT_MODE=");
+  Serial.println(alertModeLabel());
+
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V26, "MODE=" + String(alertModeLabel()));
+  }
 }
 
 // -------------------- Main tasks --------------------
@@ -1372,14 +1596,21 @@ void readSensorsAndPredict() {
   if (accMag > accPeak) accPeak = accMag;
   sampleCount++;
 
-  bool wasFailing = isMachineFailing;
-  isMachineFailing = evaluateLocalAI();
+  bool previousMpuDeviation = mpuDeviationActive;
 
-  if (isMachineFailing && !wasFailing) {
-    anomalyAlertActive = true;
-    anomalyAlertStartMs = millis();
-    Blynk.logEvent("machine_alert", "AI anomaly detected by local edge inference");
+  if (isMpuAlertMode()) {
+    evaluateMpuDeviationMode();
+    if (mpuDeviationActive && !previousMpuDeviation) {
+      anomalyAlertActive = true;
+      anomalyAlertStartMs = millis();
+      Blynk.logEvent("machine_alert", "MPU deviation anomaly detected");
+    }
+  } else {
+    mpuDeviationStreak = 0;
+    mpuDeviationActive = false;
   }
+
+  isMachineFailing = currentModeFailureActive();
 
   // Serial output
   Serial.print(accMag);      Serial.print(",");
@@ -1391,35 +1622,80 @@ void readSensorsAndPredict() {
 }
 
 void updateBlynk() {
+  if (!Blynk.connected()) return;
   if (emergencyTriggered && !debugMode) return;
 
-  int sw420val = digitalRead(SW420_PIN);
+  // ---- cache for change-only writes ----
+  static int lastV7 = -1, lastV14 = -1, lastV15 = -1, lastV20 = -1, lastV21 = -1;
+  static int lastV22 = -9999, lastV23 = -9999, lastV24 = -9999, lastV25 = -9999;
+  static int lastV27 = -1, lastV28 = -1, lastV29 = -1;
+  static int lastV16 = -1, lastV17 = -1, lastV18 = -9999;
+  static String lastV19 = "", lastV26 = "";
+  static float lastV30 = -99999.0, lastV31 = -99999.0;
 
-  Blynk.virtualWrite(V0, accMag);
-  Blynk.virtualWrite(V1, gyroMag);
-  Blynk.virtualWrite(V2, gx);
-  Blynk.virtualWrite(V3, gy);
-  Blynk.virtualWrite(V4, gz);
-  Blynk.virtualWrite(V5, sw420val);
-  Blynk.virtualWrite(V6, getTimeString());
-  Blynk.virtualWrite(V7, isMachineFailing ? 255 : 0);
+  // status line + mode telemetry
+  String statusLine = buildModeStatusLine();
+  if (statusLine != lastV26) { Blynk.virtualWrite(V26, statusLine); lastV26 = statusLine; }
 
-  Blynk.virtualWrite(V14, motorOn ? 1 : 0);
-  Blynk.virtualWrite(V15, fanOn ? 1 : 0);
-  Blynk.virtualWrite(V20, buzzerManualOn ? 1 : 0);
-  Blynk.virtualWrite(V21, ledManualOn ? 1 : 0);
+  if (alertMode != lastV29) { Blynk.virtualWrite(V29, alertMode); lastV29 = alertMode; }
+  if (alertMode != lastV28) { Blynk.virtualWrite(V28, alertMode); lastV28 = alertMode; }
 
-  // keep sliders/switch synced
-  Blynk.virtualWrite(V22, sw420ThresholdSec);
-  Blynk.virtualWrite(V23, sw420FrameSec);
-  Blynk.virtualWrite(V27, debugMode ? 1 : 0);
+  float metric1 = 0.0, metric2 = 0.0;
+  if (isSw420AlertMode()) {
+    metric1 = sw420HighAccumulatedMs / 1000.0f;
+    metric2 = (float)sw420ThresholdSec;
+  } else if (isMpuAlertMode()) {
+    metric1 = mpuLastAccDeviation;
+    metric2 = mpuLastGyroDeviation;
+  } else {
+    metric1 = backendHasScore ? backendLastScore : -1.0f;
+    metric2 = backendHasThreshold ? backendLastThreshold : -1.0f;
+  }
 
-  Blynk.virtualWrite(V16, (int)streamSuccessCount);
-  Blynk.virtualWrite(V17, (int)streamFailCount);
-  Blynk.virtualWrite(V18, lastStreamHttpCode);
-  Blynk.virtualWrite(V19, lastStreamResult);
+  if (fabs(metric1 - lastV30) > 0.05f) { Blynk.virtualWrite(V30, metric1); lastV30 = metric1; }
+  if (fabs(metric2 - lastV31) > 0.05f) { Blynk.virtualWrite(V31, metric2); lastV31 = metric2; }
 
-  pushCalibrationToBlynk();
+  int v7 = isMachineFailing ? 255 : 0;
+  if (v7 != lastV7) { Blynk.virtualWrite(V7, v7); lastV7 = v7; }
+
+  int v14 = motorOn ? 1 : 0;
+  int v15 = fanOn ? 1 : 0;
+  int v20 = buzzerManualOn ? 1 : 0;
+  int v21 = ledManualOn ? 1 : 0;
+  int v27 = debugMode ? 1 : 0;
+
+  if (v14 != lastV14) { Blynk.virtualWrite(V14, v14); lastV14 = v14; }
+  if (v15 != lastV15) { Blynk.virtualWrite(V15, v15); lastV15 = v15; }
+  if (v20 != lastV20) { Blynk.virtualWrite(V20, v20); lastV20 = v20; }
+  if (v21 != lastV21) { Blynk.virtualWrite(V21, v21); lastV21 = v21; }
+  if (v27 != lastV27) { Blynk.virtualWrite(V27, v27); lastV27 = v27; }
+
+  if (sw420ThresholdSec != lastV22) { Blynk.virtualWrite(V22, sw420ThresholdSec); lastV22 = sw420ThresholdSec; }
+  if (sw420FrameSec != lastV23) { Blynk.virtualWrite(V23, sw420FrameSec); lastV23 = sw420FrameSec; }
+
+  int v24 = (int)mpuAccDeviationThreshold;
+  int v25 = (int)mpuGyroDeviationThreshold;
+  if (v24 != lastV24) { Blynk.virtualWrite(V24, v24); lastV24 = v24; }
+  if (v25 != lastV25) { Blynk.virtualWrite(V25, v25); lastV25 = v25; }
+
+  // stream/calibration stats only every ~15s (updateBlynk runs every 3s)
+  static uint8_t slowTick = 0;
+  slowTick++;
+  if (slowTick >= 5) {
+    slowTick = 0;
+
+    int v16 = (int)streamSuccessCount;
+    int v17 = (int)streamFailCount;
+    int v18 = lastStreamHttpCode;
+    String v19 = lastStreamResult;
+
+    if (v16 != lastV16) { Blynk.virtualWrite(V16, v16); lastV16 = v16; }
+    if (v17 != lastV17) { Blynk.virtualWrite(V17, v17); lastV17 = v17; }
+    if (v18 != lastV18) { Blynk.virtualWrite(V18, v18); lastV18 = v18; }
+    if (v19 != lastV19) { Blynk.virtualWrite(V19, v19); lastV19 = v19; }
+
+    pushCalibrationToBlynk();
+  }
 }
 
 void updateThingSpeak() {
@@ -1428,7 +1704,7 @@ void updateThingSpeak() {
   float accAvg = 0;
   if (sampleCount > 0) accAvg = accSum / sampleCount;
 
-  int sw420val = digitalRead(SW420_PIN);
+  int sw420val = isSw420ActiveFiltered() ? 1 : 0;
 
   ThingSpeak.setField(1, accAvg);
   ThingSpeak.setField(2, accPeak);
@@ -1454,6 +1730,8 @@ void updateThingSpeak() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
+  Serial.print("RESET_REASON=");
+  Serial.println((int)esp_reset_reason());
   Serial.println("S1: boot");
 
   Wire.begin(21, 22);
@@ -1467,15 +1745,21 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(LED_PIN, OUTPUT);
 
-  motorOn = true;
-  fanOn = true;
+  // Keep high-current outputs OFF on boot to avoid brownout/power resets.
+  motorOn = false;
+  fanOn = false;
   buzzerManualOn = false;
   ledManualOn = false;
   applyIndicators();
   Serial.println("S4: pins");
 
-  attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, RISING);
-  Serial.println("S5: interrupt");
+  calibrateSw420Polarity();
+  if (SW420_USE_INTERRUPT) {
+    attachInterrupt(digitalPinToInterrupt(SW420_PIN), emergencyKillSwitch, CHANGE);
+    Serial.println("S5: interrupt enabled");
+  } else {
+    Serial.println("S5: interrupt disabled (polling mode)");
+  }
 
   // Stable WiFi setup
   WiFi.mode(WIFI_STA);
@@ -1510,7 +1794,10 @@ void setup() {
   updateCalibrationRuntime("idle", 0, "Ready", false);
   Serial.println("S8: model loaded");
 
-  configureStreamWebSocket();
+  streamStateMutex = xSemaphoreCreateMutex();
+  if (streamStateMutex == nullptr) {
+    Serial.println("S8b: stream mutex init failed");
+  }
 
   // init SW420 frame timers
   sw420FrameStartMs = millis();
@@ -1520,16 +1807,23 @@ void setup() {
   if (Blynk.connected()) {
     Blynk.virtualWrite(V22, sw420ThresholdSec);
     Blynk.virtualWrite(V23, sw420FrameSec);
+    Blynk.virtualWrite(V24, (int)mpuAccDeviationThreshold);
+    Blynk.virtualWrite(V25, (int)mpuGyroDeviationThreshold);
     Blynk.virtualWrite(V27, debugMode ? 1 : 0);
-    Blynk.virtualWrite(V26, "INIT | waiting first frame");
+    Blynk.virtualWrite(V28, alertMode);
+    Blynk.virtualWrite(V26, "MODE=" + String(alertModeLabel()) + " | INIT");
+    Blynk.virtualWrite(V29, alertMode);
+    Blynk.virtualWrite(V30, 0);
+    Blynk.virtualWrite(V31, 0);
   }
 
   // Timers
   timer.setInterval(100L, readSensorsAndPredict);
-  timer.setInterval(1000L, updateBlynk);
-  timer.setInterval(1000L, sendStreamToBackend);
-  timer.setInterval(5000L, reportBackendTelemetry);
-  timer.setInterval(16000L, updateThingSpeak);
+  timer.setInterval(3000L, updateBlynk);     // reduced Blynk writes
+  timer.setInterval(1000L, enqueueStreamSampleTask);
+  timer.setInterval(5000L, sendStreamToBackend);
+  timer.setInterval(10000L, reportBackendTelemetry);
+  timer.setInterval(30000L, updateThingSpeak);
   timer.setInterval(BINDING_REFRESH_INTERVAL_MS, refreshActiveBindingTask);
 
   timer.setTimeout(6000L, refreshActiveBindingTask);
@@ -1538,17 +1832,17 @@ void setup() {
   timer.setInterval(1800000L, requestCalibrationFromBackend);   // 30 min
   timer.setInterval(2000L, pollCalibrationJobStatus);           // 2 sec
 
+  Serial.println("S8c: stream uploader task disabled (timer mode)");
+
   Serial.println("S9: setup complete");
 }
 
 void loop() {
   ensureWiFiConnection();
-  streamWebSocket.loop();
-  ensureStreamWebSocketConnection();
 
   processSw420Trigger();
 
-  if (sw420FaultLatched && !sw420FaultAnnounced) {
+  if (isSw420AlertMode() && sw420FaultLatched && !sw420FaultAnnounced) {
     if (!debugMode) {
       Blynk.logEvent("critical_failure", "SW420 frame threshold exceeded");
       Serial.println("EMERGENCY WARNING: SW420 frame threshold exceeded");
@@ -1585,6 +1879,8 @@ void loop() {
     Serial.print(accMag);
     Serial.print(" fail=");
     Serial.print(isMachineFailing ? "1" : "0");
+    Serial.print(" mode=");
+    Serial.print(alertModeLabel());
     Serial.print(" debug=");
     Serial.print(debugMode ? "1" : "0");
     Serial.print(" th=");
