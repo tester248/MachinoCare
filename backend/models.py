@@ -83,6 +83,7 @@ class CalibrationRequest(BaseModel):
     contamination: float = Field(default=0.05, ge=0.01, le=0.40)
     model_variant: str = Field(default="ocsvm_distilled", min_length=1, max_length=64)
     min_consecutive_windows: int = Field(default=3, ge=1, le=10)
+    force_train_on_low_quality: bool = False
     new_device_setup: bool = False
     trigger_source: str = Field(default="manual", min_length=1, max_length=64)
 

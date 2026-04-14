@@ -548,7 +548,7 @@ with st.sidebar:
         key="form_calibration_duration_seconds",
     )
     contamination = st.slider(
-        "Isolation Forest contamination",
+        "SVM nu (expected anomaly fraction)",
         min_value=0.01,
         max_value=0.40,
         step=0.01,
@@ -630,6 +630,10 @@ with st.sidebar:
     st.subheader("Calibration")
     use_profile_defaults = st.toggle("Use saved profile settings", value=True)
     new_device_setup = st.toggle("New device setup", value=True)
+    force_train_on_low_quality = st.toggle(
+        "Demo mode: force training (ignore sample/quality checks)",
+        value=False,
+    )
 
     if st.button("Start calibration training", width="stretch"):
         if selected_profile is None:
@@ -646,6 +650,7 @@ with st.sidebar:
                     (
                         f"{api_base}/api/v1/calibrate/start/profile/{selected_device_name}"
                         f"?new_device_setup={query}&trigger_source=dashboard_ui"
+                        f"&force_train_on_low_quality={'true' if bool(force_train_on_low_quality) else 'false'}"
                         f"&calibration_duration_seconds={int(calibration_duration_seconds)}"
                     ),
                     method="POST",
@@ -661,6 +666,7 @@ with st.sidebar:
                     "window_seconds": int(window_seconds),
                     "contamination": float(contamination),
                     "min_consecutive_windows": int(min_consecutive_windows),
+                    "force_train_on_low_quality": bool(force_train_on_low_quality),
                     "new_device_setup": bool(new_device_setup),
                     "trigger_source": "dashboard_ui",
                 }
