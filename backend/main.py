@@ -5,6 +5,7 @@ import json
 import os
 import random
 import re
+import statistics
 import threading
 import time
 import uuid
@@ -472,39 +473,126 @@ def _compute_health_snapshot(status_payload: dict[str, Any], anomaly_count_24h: 
     }
 
 
+def _compute_vibration_statistics(machine_id: str, device_id: str) -> dict[str, Any]:
+    """Compute vibration statistics from recent samples for fault diagnosis."""
+    # Fetch recent samples (last 500 samples ~2 minutes at 4Hz)
+    recent_samples = store.get_recent_samples(machine_id, device_id=device_id, seconds=300, limit=500)
+    
+    if not recent_samples:
+        return {
+            "acc_mags": [],
+            "gyro_mags": [],
+            "acc_current": None,
+            "gyro_current": None,
+            "acc_mean": None,
+            "acc_max": None,
+            "acc_stddev": None,
+            "gyro_mean": None,
+            "gyro_max": None,
+            "gyro_stddev": None,
+            "vibration_level": "unknown",
+            "trend": "unknown",
+        }
+    
+    acc_mags = [float(s.get("acc_mag", 0)) for s in recent_samples if s.get("acc_mag") is not None]
+    gyro_mags = [float(s.get("gyro_mag", 0)) for s in recent_samples if s.get("gyro_mag") is not None]
+    
+    def safe_stats(values: list[float]) -> tuple[float | None, float | None, float | None]:
+        if not values:
+            return None, None, None
+        mean_val = statistics.mean(values)
+        max_val = max(values)
+        try:
+            stddev_val = statistics.stdev(values) if len(values) > 1 else 0.0
+        except statistics.StatisticsError:
+            stddev_val = 0.0
+        return mean_val, max_val, stddev_val
+    
+    acc_mean, acc_max, acc_stddev = safe_stats(acc_mags)
+    gyro_mean, gyro_max, gyro_stddev = safe_stats(gyro_mags)
+    
+    # Classify vibration level
+    vibration_level = "normal"
+    if acc_max and acc_max > 30000:
+        vibration_level = "high"
+    elif acc_max and acc_max > 20000:
+        vibration_level = "elevated"
+    
+    # Compute trend (comparing first half vs second half)
+    trend = "stable"
+    if len(acc_mags) >= 10:
+        mid = len(acc_mags) // 2
+        first_half_mean = statistics.mean(acc_mags[:mid]) if mid > 0 else 0
+        second_half_mean = statistics.mean(acc_mags[mid:]) if len(acc_mags) > mid else 0
+        if second_half_mean > first_half_mean * 1.15:
+            trend = "increasing"
+        elif second_half_mean < first_half_mean * 0.85:
+            trend = "decreasing"
+    
+    return {
+        "acc_mags": acc_mags,
+        "gyro_mags": gyro_mags,
+        "acc_current": acc_mags[-1] if acc_mags else None,
+        "gyro_current": gyro_mags[-1] if gyro_mags else None,
+        "acc_mean": round(acc_mean, 2) if acc_mean is not None else None,
+        "acc_max": round(acc_max, 2) if acc_max is not None else None,
+        "acc_stddev": round(acc_stddev, 2) if acc_stddev is not None else None,
+        "gyro_mean": round(gyro_mean, 2) if gyro_mean is not None else None,
+        "gyro_max": round(gyro_max, 2) if gyro_max is not None else None,
+        "gyro_stddev": round(gyro_stddev, 2) if gyro_stddev is not None else None,
+        "vibration_level": vibration_level,
+        "trend": trend,
+        "sample_count": len(acc_mags),
+    }
+
+
 def _build_report_prompt(
     machine_id: str,
     device_id: str,
     status_payload: dict[str, Any],
     snapshot: dict[str, Any],
+    vibration_stats: dict[str, Any] | None = None,
 ) -> str:
     current = status_payload.get("current") or {}
     calibration = status_payload.get("calibration") or {}
     model_summary = status_payload.get("model_summary") or {}
+    
+    # Build vibration data section
+    vib_section = ""
+    if vibration_stats:
+        vib_section = (
+            f"Vibration level: {vibration_stats.get('vibration_level')}\n"
+            f"Vibration trend (5min): {vibration_stats.get('trend')}\n"
+            f"Current acceleration magnitude: {vibration_stats.get('acc_current')}\n"
+            f"Accel mean (5min): {vibration_stats.get('acc_mean')}, "
+            f"max: {vibration_stats.get('acc_max')}, "
+            f"stddev: {vibration_stats.get('acc_stddev')}\n"
+            f"Gyro magnitude mean (5min): {vibration_stats.get('gyro_mean')}, "
+            f"max: {vibration_stats.get('gyro_max')}, "
+            f"stddev: {vibration_stats.get('gyro_stddev')}\n"
+        )
 
     return (
-        "You are a predictive maintenance analyst for rotating machines. "
-        "Write a short health report in plain text.\n"
-        "Output format requirements:\n"
-        "- Maximum 90 words.\n"
-        "- 2 to 4 bullet points.\n"
-        "- End with one action sentence.\n"
-        "- No markdown heading.\n\n"
-        f"Machine ID: {machine_id}\n"
-        f"Device ID: {device_id}\n"
-        f"Health score (%): {snapshot.get('health_score_percent')}\n"
-        f"Health band: {snapshot.get('health_band')}\n"
-        f"Current anomaly flag: {status_payload.get('is_anomaly')}\n"
+        "You are an expert vibration analyst for predictive maintenance on rotating machinery. "
+        "Analyze the telemetry and provide a diagnostic report that includes: "
+        "(1) whether vibrations are normal/elevated/high, "
+        "(2) the current health status, "
+        "(3) a suggested fault type (if anomalies detected), and "
+        "(4) recommended action.\n"
+        "Output format:\n"
+        "- Exactly 3 bullet points (vibration status, health diagnosis, fault/action).\n"
+        "- Maximum 110 words total.\n"
+        "- Use technical but accessible language.\n"
+        "- No markdown formatting.\n\n"
+        f"Machine: {machine_id} | Device: {device_id}\n"
+        f"Health score: {snapshot.get('health_score_percent')}% ({snapshot.get('health_band')})\n"
+        f"Anomaly status: {status_payload.get('is_anomaly')}\n"
         f"Status label: {status_payload.get('status_label')}\n"
-        f"Current anomaly score: {current.get('score')}\n"
-        f"Decision threshold: {current.get('decision_threshold')}\n"
+        f"Anomaly score: {current.get('score')} / threshold: {current.get('decision_threshold')}\n"
         f"Consecutive anomaly windows: {current.get('consecutive_windows')}\n"
-        f"Anomaly events (24h): {(snapshot.get('components') or {}).get('anomaly_count_24h')}\n"
-        f"Last update timestamp: {current.get('last_update')}\n"
-        f"Calibration stage: {calibration.get('stage')}\n"
-        f"Calibration progress: {calibration.get('progress')}\n"
-        f"Model type: {model_summary.get('model_type')}\n"
-        f"Model quality correlation: {model_summary.get('quality_correlation')}\n"
+        f"24-hour anomaly events: {(snapshot.get('components') or {}).get('anomaly_count_24h')}\n"
+        f"Current model type: {model_summary.get('model_type')}\n\n"
+        f"{vib_section}"
     )
 
 
@@ -519,6 +607,7 @@ def _generate_report_with_groq(
     device_id: str,
     status_payload: dict[str, Any],
     snapshot: dict[str, Any],
+    vibration_stats: dict[str, Any] | None = None,
 ) -> str:
     if not GROQ_API_KEY:
         raise RuntimeError("GROQ_API_KEY is not configured")
@@ -526,11 +615,11 @@ def _generate_report_with_groq(
     payload = {
         "model": GROQ_MODEL,
         "temperature": 0.2,
-        "max_tokens": 220,
+        "max_tokens": 280,
         "messages": [
             {
                 "role": "system",
-                "content": "You produce concise machine-health reports from telemetry.",
+                "content": "You are a vibration diagnostics expert. Provide insightful, actionable machine health reports.",
             },
             {
                 "role": "user",
@@ -539,6 +628,7 @@ def _generate_report_with_groq(
                     device_id=device_id,
                     status_payload=status_payload,
                     snapshot=snapshot,
+                    vibration_stats=vibration_stats,
                 ),
             },
         ],
@@ -591,6 +681,7 @@ def _build_machine_insight(machine_id: str, device_id: str, *, force_regenerate:
     status_payload = get_status_for_device(machine_id, device_id)
     anomaly_count_24h = len(store.get_anomalies(machine_id, device_id=device_id, hours=24, limit=200))
     snapshot = _compute_health_snapshot(status_payload, anomaly_count_24h)
+    vibration_stats = _compute_vibration_statistics(machine_id, device_id)
 
     cache_key = _insight_cache_key(machine_id, device_id)
     with insight_cache_lock:
@@ -606,7 +697,7 @@ def _build_machine_insight(machine_id: str, device_id: str, *, force_regenerate:
         report_error = None
 
         try:
-            llm_report = _generate_report_with_groq(machine_id, device_id, status_payload, snapshot)
+            llm_report = _generate_report_with_groq(machine_id, device_id, status_payload, snapshot, vibration_stats)
         except Exception as exc:  # noqa: BLE001
             llm_report = _fallback_report(snapshot, status_payload)
             report_source = "fallback"
@@ -879,12 +970,18 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
     collection_seconds = _calibration_collection_seconds(payload)
 
     samples, source = resolve_calibration_samples(payload)
-    if len(samples) < 20:
+    if len(samples) < 20 and not payload.force_train_on_low_quality:
+        sample_count = len(samples)
+        required_min = 20
+        expected_count = max(1, int(payload.sample_rate_hz * collection_seconds))
         raise HTTPException(
             status_code=400,
             detail=(
                 "Insufficient samples for calibration. Provide at least 20 samples, "
-                "or increase fallback_seconds."
+                "or increase fallback_seconds. "
+                f"Metrics: sample_count={sample_count}, required_min={required_min}, "
+                f"expected_count={expected_count}, sample_rate_hz={payload.sample_rate_hz}, "
+                f"collection_seconds={collection_seconds}."
             ),
         )
 
@@ -894,21 +991,34 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         sample_rate_hz=payload.sample_rate_hz,
         collection_seconds=collection_seconds,
     )
-    if not quality["passed"]:
+    if not quality["passed"] and not payload.force_train_on_low_quality:
         failed_checks = ", ".join(quality["failed_checks"]) or "unknown_quality_issue"
+        metrics = quality.get("metrics", {})
+        sample_count = int(metrics.get("sample_count", len(samples)))
+        expected_count = int(metrics.get("expected_count", max(1, payload.sample_rate_hz * collection_seconds)))
+        coverage_ratio = float(metrics.get("coverage_ratio", 0.0))
+        gap_ratio = float(metrics.get("timestamp_gap_ratio", 0.0))
+        max_gap = float(metrics.get("max_allowed_gap_seconds", 0.0))
         raise HTTPException(
             status_code=400,
             detail=(
                 "Calibration data quality check failed. "
                 f"Failed checks: {failed_checks}. "
+                f"Metrics: sample_count={sample_count}, expected_count={expected_count}, "
+                f"coverage_ratio={coverage_ratio:.3f}, gap_ratio={gap_ratio:.3f}, "
+                f"max_allowed_gap_s={max_gap:.2f}. "
                 "Recalibrate with longer stable baseline capture."
             ),
         )
 
-    effective_window_size = max(8, payload.sample_rate_hz * payload.window_seconds)
+    if payload.force_train_on_low_quality:
+      effective_window_size = max(1, min(max(2, payload.sample_rate_hz * payload.window_seconds), len(training_samples)))
+    else:
+      effective_window_size = max(8, payload.sample_rate_hz * payload.window_seconds)
+
     feature_matrix = build_feature_matrix(training_samples, window_size=effective_window_size)
 
-    if feature_matrix.shape[0] < 8:
+    if feature_matrix.shape[0] < 8 and not payload.force_train_on_low_quality:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -916,6 +1026,16 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
                 "Increase sample count or reduce window size."
             ),
         )
+
+    if payload.force_train_on_low_quality and feature_matrix.shape[0] <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Force-train requested but zero usable windows were produced.",
+        )
+
+    if payload.force_train_on_low_quality and feature_matrix.shape[0] < 8:
+        reps = int(np.ceil(8 / feature_matrix.shape[0]))
+        feature_matrix = np.tile(feature_matrix, (reps, 1))[:8, :]
 
     model_variant = str(payload.model_variant or "ocsvm_distilled").strip().lower()
     if model_variant == "if_distilled":
@@ -957,6 +1077,8 @@ def perform_calibration(payload: CalibrationRequest) -> CalibrationResponse:
         "trained_on_windows": int(distilled["window_count"]),
         "trained_on_samples": len(samples),
         "calibration_quality": quality,
+        "quality_override_enabled": bool(payload.force_train_on_low_quality),
+        "quality_checks_passed": bool(quality.get("passed", False)),
         "created_at": utc_iso_now(),
         "target_machine_id": machine_id,
         "target_device_id": device_id,
@@ -1363,6 +1485,7 @@ def calibrate_start_from_profile(
     device_name: str,
     new_device_setup: bool = Query(default=True),
     trigger_source: str = Query(default="dashboard_profile"),
+    force_train_on_low_quality: bool = Query(default=False),
     calibration_duration_seconds: int | None = Query(default=None, ge=10, le=86400),
 ) -> CalibrationStartResponse:
     profile = _resolve_profile_or_404(device_name)
@@ -1379,6 +1502,7 @@ def calibrate_start_from_profile(
         calibration_duration_seconds=int(calibration_duration_seconds or profile.get("fallback_seconds") or 300),
         contamination=float(profile.get("contamination") or 0.05),
         min_consecutive_windows=int(profile.get("min_consecutive_windows") or 3),
+        force_train_on_low_quality=bool(force_train_on_low_quality),
         new_device_setup=new_device_setup,
         trigger_source=trigger_source,
     )
@@ -1411,6 +1535,26 @@ def get_model_for_device(device_name: str) -> dict[str, Any]:
     return {
         "status": "success",
         "device_name": _normalize_device_name(device_name),
+        "model_package": package,
+    }
+
+
+@router.get("/model/{machine_id}/{device_id}")
+def get_model_for_machine_device(machine_id: str, device_id: str) -> dict[str, Any]:
+    """Serve model package by explicit machine_id and device_id.
+    
+    This endpoint is used by ESP32 firmware to pull the model after calibration.
+    """
+    package = store.get_model_package(machine_id, device_id)
+    if not package:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No model package found for machine '{machine_id}' device '{device_id}'.",
+        )
+    return {
+        "status": "success",
+        "machine_id": machine_id,
+        "device_id": device_id,
         "model_package": package,
     }
 
