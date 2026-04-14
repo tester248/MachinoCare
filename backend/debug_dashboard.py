@@ -249,7 +249,13 @@ def get_debug_dashboard_html() -> str:
         <div class="row"><label for="ws">window_seconds</label><input id="ws" type="number" value="1" min="1" max="10" /></div>
         <div class="row"><label for="fb">fallback_seconds</label><input id="fb" type="number" value="300" min="10" max="86400" /></div>
         <div class="row"><label for="cd">calibration_duration_seconds</label><input id="cd" type="number" value="300" min="10" max="86400" /></div>
-        <div class="row"><label for="cont">contamination</label><input id="cont" type="number" value="0.05" min="0.01" max="0.40" step="0.01" /></div>
+        <div class="row" style="margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px solid #e0e8ef;">
+          <h4 style="margin:0 0 0.4rem; color:#10263a; font-size:0.9rem;">Calibration Options</h4>
+        </div>
+        <div class="row"><label style="display:flex; align-items:center; gap:0.3rem;"><input id="newDeviceSetup" type="checkbox" checked/>New device setup</label></div>
+        <div class="row"><label style="display:flex; align-items:center; gap:0.3rem;"><input id="useProfileDefaults" type="checkbox" checked/>Use profile settings</label></div>
+        <div class="row"><label style="display:flex; align-items:center; gap:0.3rem;"><input id="forceTrain" type="checkbox" />Demo mode (force training)</label></div>
+        <div class="row"><label for="cont">svm_nu (expected anomaly fraction)</label><input id="cont" type="number" value="0.05" min="0.01" max="0.40" step="0.01" /></div>
         <div class="row"><label for="minw">min_consecutive_windows</label><input id="minw" type="number" value="3" min="1" max="10" /></div>
         <div class="row" style="align-items:flex-start;">
           <div style="width:100%;">
@@ -257,8 +263,11 @@ def get_debug_dashboard_html() -> str:
             <textarea id="notes"></textarea>
           </div>
         </div>
-        <div class="hint" id="bindingHint">Active stream association: none.</div>
+        <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:0.5rem; margin:0.6rem 0; font-size:0.8rem;">
+          <div class="hint" id="bindingHint" style="margin:0; color:#15803d;">✓ Active stream association: none.</div>
+        </div>
         <div class="hint" id="profileHint">Select a profile by display name to manage settings.</div>
+        <div class="hint" id="calibHint" style="margin-top:0.5rem; color:#c2410c;"></div>
       </section>
 
       <section class="card logs">
@@ -396,7 +405,13 @@ def get_debug_dashboard_html() -> str:
     }
 
     function selectedFields() {
-      return fieldConfig.filter(f => el(`f_${f.key}`) && el(`f_${f.key}`).checked).map(f => f.key);
+      const fields = fieldConfig.filter(f => {
+        const el_ele = el(`f_${f.key}`);
+        const isChecked = el_ele && el_ele.checked;
+        return isChecked;
+      }).map(f => f.key);
+      console.log('selectedFields():', fields);
+      return fields;
     }
 
     function renderFieldControls() {
@@ -592,9 +607,12 @@ def get_debug_dashboard_html() -> str:
 
     function resetChartData() {
       timestamps.length = 0;
-      for (const key of Object.keys(traces)) {
-        traces[key].length = 0;
+      
+      // Initialize all field traces
+      for (const cfg of fieldConfig) {
+        traces[cfg.key] = [];
       }
+      
       lastTimestamp = null;
       duplicateTimestampOffsetMs = 0;
       lastSampleSignature = '';
@@ -617,12 +635,21 @@ def get_debug_dashboard_html() -> str:
     }
 
     function appendSample(sample, status) {
-      if (!sample || !sample.timestamp) return;
+      if (!sample || !sample.timestamp) {
+        console.log('appendSample: skipped - no sample or timestamp');
+        return;
+      }
       const signature = buildSampleSignature(sample, status);
-      if (signature === lastSampleSignature) return;
+      if (signature === lastSampleSignature) {
+        console.log('appendSample: skipped - duplicate signature');
+        return;
+      }
       lastSampleSignature = signature;
       const timestamp = parseTimestamp(sample.timestamp);
-      if (!timestamp) return;
+      if (!timestamp) {
+        console.log('appendSample: failed to parse timestamp:', sample.timestamp);
+        return;
+      }
       const stamp = timestamp.valueOf();
       let chartStamp = stamp;
       if (stamp === lastTimestamp) {
@@ -652,6 +679,7 @@ def get_debug_dashboard_html() -> str:
       }
 
       if (timestamps.length > 600) timestamps.shift();
+      console.log('appendSample: added point, total =', timestamps.length);
     }
 
     async function loadRecentSamples(deviceName, lookbackSeconds) {
@@ -659,15 +687,23 @@ def get_debug_dashboard_html() -> str:
       try {
         const seconds = Math.max(10, Number(lookbackSeconds || 120));
         const response = await fetch(`/api/v1/stream/recent/${encodeURIComponent(deviceName)}?seconds=${seconds}&limit=600`);
-        if (!response.ok) return;
+        if (!response.ok) {
+          console.warn(`loadRecentSamples HTTP ${response.status}`);
+          return;
+        }
         const payload = await response.json();
         const samples = Array.isArray(payload.samples) ? payload.samples : [];
+        console.log(`Loaded ${samples.length} recent samples`);
+        let appendedCount = 0;
         for (const sample of samples) {
+          const before = timestamps.length;
           appendSample(sample, null);
+          if (timestamps.length > before) appendedCount++;
         }
+        console.log(`Appended ${appendedCount} samples to chart`);
         renderChart();
-      } catch (_) {
-        // Best-effort fallback only; websocket/status still drive live dashboard.
+      } catch (err) {
+        console.error('loadRecentSamples error:', err);
       }
     }
 
@@ -688,43 +724,56 @@ def get_debug_dashboard_html() -> str:
     }
 
     function renderChartPanel(targetId, allowedKeys, yAxisTitle, emptyMessage) {
-      const fields = selectedFields();
-      const plotData = [];
+      try {
+        const fields = selectedFields();
+        console.log(`renderChartPanel(${targetId}): selectedFields =`, fields, 'total timestamps =', timestamps.length);
+        
+        const plotData = [];
 
-      for (const cfg of fieldConfig) {
-        if (!allowedKeys.includes(cfg.key) || !fields.includes(cfg.key)) continue;
-        plotData.push({
-          x: timestamps,
-          y: traces[cfg.key] || [],
-          name: cfg.label,
-          mode: 'lines+markers',
-          line: { width: 2, color: cfg.color },
-          marker: { size: 4, color: cfg.color }
-        });
+        for (const cfg of fieldConfig) {
+          if (!allowedKeys.includes(cfg.key) || !fields.includes(cfg.key)) continue;
+          const traceData = traces[cfg.key] || [];
+          console.log(`  trace ${cfg.key}: ${traceData.length} points`);
+          plotData.push({
+            x: timestamps,
+            y: traceData,
+            name: cfg.label,
+            mode: 'lines',
+            line: { width: 2.5, color: cfg.color },
+            hovertemplate: `<b>${cfg.label}</b><br>%{x}<br>%{y:.4f}<extra></extra>`
+          });
+        }
+
+        console.log(`renderChartPanel(${targetId}): ${plotData.length} traces, ${timestamps.length} timestamps`);
+
+        const layout = {
+          margin: { l: 42, r: 18, t: 30, b: 35 },
+          template: 'plotly_white',
+          legend: { orientation: 'h', x: 0, y: 1 },
+          xaxis: { title: 'timestamp', type: 'date' },
+          yaxis: { title: yAxisTitle },
+          hovermode: 'x unified',
+          autosize: true,
+          dragmode: 'zoom'
+        };
+
+        if (plotData.length === 0) {
+          layout.annotations = [{
+            text: emptyMessage,
+            showarrow: false,
+            x: 0.5,
+            y: 0.5,
+            xref: 'paper',
+            yref: 'paper',
+            font: { color: '#64748b', size: 13 }
+          }];
+        }
+
+        Plotly.react(targetId, plotData, layout, { displayModeBar: true, responsive: true });
+        console.log(`renderChartPanel(${targetId}): Plotly.react completed`);
+      } catch (err) {
+        console.error(`Chart render error for ${targetId}:`, err);
       }
-
-      const layout = {
-        margin: { l: 42, r: 18, t: 30, b: 35 },
-        template: 'plotly_white',
-        legend: { orientation: 'h' },
-        xaxis: { title: 'timestamp' },
-        yaxis: { title: yAxisTitle },
-        hovermode: 'x unified'
-      };
-
-      if (plotData.length === 0) {
-        layout.annotations = [{
-          text: emptyMessage,
-          showarrow: false,
-          x: 0.5,
-          y: 0.5,
-          xref: 'paper',
-          yref: 'paper',
-          font: { color: '#64748b', size: 13 }
-        }];
-      }
-
-      Plotly.react(targetId, plotData, layout, { displayModeBar: true, responsive: true });
     }
 
     function renderChart() {
@@ -843,14 +892,17 @@ def get_debug_dashboard_html() -> str:
     }
 
     function updateBindingHint(binding) {
+      const hint = el('bindingHint');
       if (binding && binding.is_active && binding.machine_id && binding.device_id) {
         const key = profileKey(binding.machine_id, binding.device_id);
         const profile = profilesByKey.get(key);
         const label = profile ? profile.display_label : `${binding.machine_id}/${binding.device_id}`;
-        el('bindingHint').textContent = `Active stream association: ${label}`;
+        hint.textContent = `✓ Active stream association: ${label}`;
+        hint.style.color = '#15803d';
         return;
       }
-      el('bindingHint').textContent = 'Active stream association: none.';
+      hint.textContent = '⚠ Active stream association: none. Use "Associate Stream" button to route incoming data.';
+      hint.style.color = '#b45309';
     }
 
     async function refreshBinding() {
@@ -942,6 +994,7 @@ def get_debug_dashboard_html() -> str:
     }
 
     function connectLive() {
+      console.log('connectLive: starting...');
       const profile = currentProfile();
       if (!profile) {
         el('profileHint').textContent = 'Select or create a profile first.';
@@ -952,6 +1005,7 @@ def get_debug_dashboard_html() -> str:
       const device = profile.device_id;
       const deviceName = String(profile.display_name || '').trim();
       const lookback = Number(el('lookback').value || 120);
+      console.log(`connectLive: machine=${machine}, device=${device}, deviceName=${deviceName}, lookback=${lookback}`);
 
       if (ws) {
         ws.close();
@@ -959,12 +1013,16 @@ def get_debug_dashboard_html() -> str:
       }
 
       setConnState('connecting', 'warn');
+      startChartRefresh();
       ws = new WebSocket(toWsUrl(deviceName, lookback));
+      console.log('connectLive: WebSocket created');
 
       ws.onopen = () => {
+        console.log('connectLive: WebSocket onopen');
         resetChartData();
         setConnState('connected', 'ok');
         ws.send(JSON.stringify(subscribeMessage(machine, device, lookback)));
+        console.log('connectLive: loading recent samples...');
         loadRecentSamples(deviceName, lookback);
         loadInsights(deviceName);
       };
@@ -989,10 +1047,14 @@ def get_debug_dashboard_html() -> str:
       };
 
       ws.onclose = () => {
+        console.log('connectLive: WebSocket closed');
         ws = null;
         setConnState('disconnected', 'warn');
       };
-      ws.onerror = () => setConnState('error', 'bad');
+      ws.onerror = () => {
+        console.log('connectLive: WebSocket error');
+        setConnState('error', 'bad');
+      };
     }
 
     async function onProfileSelectionChange() {
@@ -1117,18 +1179,30 @@ def get_debug_dashboard_html() -> str:
         return;
       }
 
-      const response = await fetch(`/api/v1/calibrate/start/profile/${encodeURIComponent(String(profile.display_name || '').trim())}?new_device_setup=true&trigger_source=debug_dashboard&calibration_duration_seconds=${Number(el('cd').value || 300)}`, {
-        method: 'POST'
-      });
+      const newDeviceSetup = el('newDeviceSetup').checked ? 'true' : 'false';
+      const useProfileDefaults = el('useProfileDefaults').checked ? 'true' : 'false';
+      const forceTrain = el('forceTrain').checked ? 'true' : 'false';
+      const displayName = String(profile.display_name || '').trim();
+      const calDuration = Number(el('cd').value || 300);
 
+      let url = `/api/v1/calibrate/start/profile/${encodeURIComponent(displayName)}`;
+      url += `?new_device_setup=${newDeviceSetup}`;
+      url += `&trigger_source=debug_dashboard`;
+      url += `&force_train_on_low_quality=${forceTrain}`;
+      url += `&calibration_duration_seconds=${calDuration}`;
+
+      el('calibHint').textContent = `Starting: new_device=${newDeviceSetup}, force_train=${forceTrain}, duration=${calDuration}s...`;
+
+      const response = await fetch(url, { method: 'POST' });
       const text = await response.text();
       if (!response.ok) {
         el('profileHint').textContent = `Calibration trigger failed: ${text}`;
+        el('calibHint').textContent = '';
         return;
       }
 
       const payload = JSON.parse(text);
-      el('profileHint').textContent = `Calibration job ${payload.job_id} (${payload.status})`;
+      el('calibHint').textContent = `✓ Calibration job ${payload.job_id} started (${payload.status}). Check LLM Insight for progress.`;
     }
 
     async function associateStream() {
@@ -1178,7 +1252,21 @@ def get_debug_dashboard_html() -> str:
         el('profileHint').textContent = 'Select a profile before deleting.';
         return;
       }
-      if (!window.confirm(`Delete profile ${profile.display_label}?`)) {
+      const confirmed = window.confirm(
+        `⚠️ DELETE PROFILE: ${profile.display_label}\n\n` +
+        `This will permanently delete:\n` +
+        `• Device profile ${profile.device_id}\n` +
+        `• Associated machine/device binding\n` +
+        `• All historical calibration data\n\n` +
+        `Type "yes" in the next prompt to confirm.`
+      );
+      if (!confirmed) {
+        el('profileHint').textContent = 'Profile deletion cancelled.';
+        return;
+      }
+      const finalConfirm = window.prompt('Type "yes" to confirm deletion:');
+      if (finalConfirm !== 'yes') {
+        el('profileHint').textContent = 'Profile deletion cancelled.';
         return;
       }
 
@@ -1198,11 +1286,27 @@ def get_debug_dashboard_html() -> str:
       el('profileHint').textContent = `Deleted profile ${deletedLabel}`;
     }
 
+    let chartRefreshTimer = null;
+
+    function startChartRefresh() {
+      if (chartRefreshTimer) clearInterval(chartRefreshTimer);
+      // Render chart every 500ms (less aggressive than 250ms to avoid Plotly conflicts)
+      chartRefreshTimer = setInterval(renderChart, 500);
+    }
+
+    function stopChartRefresh() {
+      if (chartRefreshTimer) {
+        clearInterval(chartRefreshTimer);
+        chartRefreshTimer = null;
+      }
+    }
+
     function disconnectLive() {
       if (ws) {
         ws.close();
         ws = null;
       }
+      stopChartRefresh();
       setConnState('disconnected', 'warn');
     }
 
