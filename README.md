@@ -331,6 +331,26 @@ Blynk relay/output control mapping (current):
 - `V20` -> buzzer
 - `V21` -> LED manual override
 
+Blynk alert mode and threshold mapping (current):
+- `V22` -> SW420 threshold seconds
+- `V23` -> SW420 frame seconds
+- `V24` -> MPU accel magnitude deviation threshold
+- `V25` -> MPU gyro magnitude deviation threshold
+- `V27` -> debug mode toggle
+- `V28` -> alert mode selector (`0=SW420 basic`, `1=MPU deviation`, `2=backend ML`)
+
+Blynk alert telemetry mapping (recommended for demo):
+- `V26` -> mode-aware status text
+- `V29` -> active alert mode (numeric mirror of V28)
+- `V30` -> primary mode metric
+    - Mode 0: SW420 accumulated HIGH seconds in current frame
+    - Mode 1: MPU accel deviation from baseline
+    - Mode 2: backend score (`-1` when unavailable)
+- `V31` -> secondary mode metric
+    - Mode 0: SW420 threshold seconds
+    - Mode 1: MPU gyro deviation from baseline
+    - Mode 2: backend decision threshold (`-1` when unavailable)
+
 Blynk setup details:
 - `docs/BLYNK_FINAL_DEMO_SETUP.md`
 
