@@ -121,6 +121,10 @@ bool buzzerManualOn = false;
 bool ledManualOn = false;
 bool productionRelayCutoffApplied = false;
 
+// Soft-start for motor relay to prevent brownout on inrush current
+unsigned long motorSoftStartMs = 0;
+const unsigned long MOTOR_SOFT_START_DURATION_MS = 500;  // Ramp up over 500ms
+
 // Anomaly alert behavior: LED OFF + buzzer pulse for 5s
 bool anomalyAlertActive = false;
 unsigned long anomalyAlertStartMs = 0;
@@ -388,7 +392,36 @@ void updateAlertOutputs() {
     }
   }
 
-  digitalWrite(RELAY_MOTOR_PIN, motorOn ? RELAY_ON : RELAY_OFF);
+  // Motor soft-start: track when motor transitions to ON and ramp it gradually to prevent brownout
+  static bool motorWasOn = false;
+  if (motorOn && !motorWasOn) {
+    motorSoftStartMs = now;  // Record the time motor was switched ON
+    motorWasOn = true;
+  } else if (!motorOn) {
+    motorWasOn = false;
+  }
+
+  // Apply soft-start ramp for motor relay
+  bool motorRelayState = RELAY_OFF;
+  if (motorOn) {
+    unsigned long elapsedMs = now - motorSoftStartMs;
+    if (elapsedMs >= MOTOR_SOFT_START_DURATION_MS) {
+      // Soft-start complete, fully enable relay
+      motorRelayState = RELAY_ON;
+    } else {
+      // During ramp, toggle relay at increasing frequency to simulate PWM
+      // Early in ramp: ON 10% of time, then 20%, 30%, etc.
+      unsigned int onPercent = (elapsedMs * 100) / MOTOR_SOFT_START_DURATION_MS;
+      unsigned long cycleMs = 50;  // 50ms cycle
+      unsigned long phaseMs = now % cycleMs;
+      unsigned long onTimeMs = (cycleMs * onPercent) / 100;
+      motorRelayState = (phaseMs < onTimeMs) ? RELAY_ON : RELAY_OFF;
+    }
+  } else if (!motorOn) {
+    motorRelayState = RELAY_OFF;
+  }
+
+  digitalWrite(RELAY_MOTOR_PIN, motorRelayState);
   digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
   digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
   digitalWrite(BUZZER_PIN, buzzerState ? BUZZER_ON : BUZZER_OFF);
