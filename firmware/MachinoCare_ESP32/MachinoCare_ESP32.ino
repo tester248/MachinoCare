@@ -131,6 +131,11 @@ unsigned long anomalyAlertStartMs = 0;
 const unsigned long ANOMALY_ALERT_DURATION_MS = 5000;
 const unsigned long ANOMALY_BUZZER_PULSE_MS = 220;
 
+// Alert notification tracking (to send in-app notifications once per event)
+bool sw420AlertNotified = false;
+bool mpuAlertNotified = false;
+bool backendAlertNotified = false;
+
 // Alert source mode (Blynk V28): 0 = SW420 basic, 1 = MPU deviation, 2 = backend ML
 const int ALERT_MODE_SW420 = 0;
 const int ALERT_MODE_MPU = 1;
@@ -337,10 +342,13 @@ void updateAlertOutputs() {
   if (sw420DebugCooldownActive && debugMode && now >= sw420DebugCooldownUntilMs) {
     sw420DebugCooldownActive = false;
     sw420FaultAnnounced = false;
+    sw420AlertNotified = false;  // Reset notification flag when cool down ends
   }
 
   if (anomalyAlertActive && (now - anomalyAlertStartMs >= ANOMALY_ALERT_DURATION_MS)) {
     anomalyAlertActive = false;
+    mpuAlertNotified = false;      // Reset notification flag when anomaly alert clears
+    backendAlertNotified = false;  // Reset notification flag when anomaly alert clears
   }
 
   bool sw420SafetyEnabled = isSw420AlertMode();
@@ -388,6 +396,7 @@ void updateAlertOutputs() {
       buzzerState = true;
     } else {
       sw420FailBuzzerActive = false;
+      sw420AlertNotified = false;  // Reset notification flag when buzzer window ends
       buzzerState = false;
     }
   }
@@ -587,6 +596,12 @@ void evaluateSw420FrameLogic() {
         // start 5s buzzer window
         sw420FailBuzzerActive = true;
         sw420FailBuzzerStartMs = millis();
+
+        // Send alert notification once
+        if (!sw420AlertNotified && Blynk.connected()) {
+          Blynk.logEvent("alert_triggered", "SW420 vibration threshold exceeded");
+          sw420AlertNotified = true;
+        }
 
         if (debugMode) {
           sw420DebugCooldownActive = true;
@@ -1056,6 +1071,12 @@ bool sendBatchOverHttpFallback(const String& payload, int payloadCount) {
     if (isBackendAlertMode() && backendAnomalyActive && !previousBackendAnomaly) {
       anomalyAlertActive = true;
       anomalyAlertStartMs = millis();
+      
+      // Send alert notification once
+      if (!backendAlertNotified && Blynk.connected()) {
+        Blynk.logEvent("alert_triggered", "Backend ML anomaly detected");
+        backendAlertNotified = true;
+      }
       Blynk.logEvent("machine_alert", "Backend ML anomaly flagged");
     }
   }
@@ -1583,6 +1604,7 @@ BLYNK_WRITE(V27) {
     emergencyTriggered = false;
     sw420FaultLatched = false;
     sw420FaultAnnounced = false;
+    sw420AlertNotified = false;
     productionRelayCutoffApplied = false;
   }
 
@@ -1607,15 +1629,18 @@ BLYNK_WRITE(V28) {
     sw420FailBuzzerActive = false;
     sw420FaultAnnounced = false;
     emergencyTriggered = false;
+    sw420AlertNotified = false;
   }
   if (!isMpuAlertMode()) {
     mpuDeviationStreak = 0;
     mpuDeviationActive = false;
+    mpuAlertNotified = false;
   }
   if (!isBackendAlertMode()) {
     backendAnomalyActive = false;
     backendHasScore = false;
     backendHasThreshold = false;
+    backendAlertNotified = false;
   } else if (backendAnomalyActive) {
     anomalyAlertActive = true;
     anomalyAlertStartMs = millis();
@@ -1660,6 +1685,12 @@ void readSensorsAndPredict() {
     if (mpuDeviationActive && !previousMpuDeviation) {
       anomalyAlertActive = true;
       anomalyAlertStartMs = millis();
+      
+      // Send alert notification once
+      if (!mpuAlertNotified && Blynk.connected()) {
+        Blynk.logEvent("alert_triggered", "MPU deviation anomaly detected");
+        mpuAlertNotified = true;
+      }
       Blynk.logEvent("machine_alert", "MPU deviation anomaly detected");
     }
   } else {
