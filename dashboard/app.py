@@ -800,6 +800,62 @@ def render_live_ui() -> None:
         st.json(st.session_state.completed_job)
         st.markdown("</div>", unsafe_allow_html=True)
 
+    # Detection Mode Selector
+    st.markdown("<div class='mc-glass'>", unsafe_allow_html=True)
+    st.markdown("<div class='mc-title'>📡 Detection Mode</div>", unsafe_allow_html=True)
+    
+    mode_cols = st.columns(3)
+    mode_labels = ["Mode 0: SW420 Basic", "Mode 1: MPU Deviation", "Mode 2: Backend ML"]
+    mode_descriptions = [
+        "Vibration detection via SW420 sensor",
+        "Acceleration/gyro deviation from baseline",
+        "Backend ML anomaly detection",
+    ]
+    
+    current_mode = status_data.get("alert_mode", 0)
+    
+    with mode_cols[0]:
+        if st.button(mode_labels[0], use_container_width=True, type="primary" if current_mode == 0 else "secondary"):
+            mode_resp, mode_err = request_json(
+                f"{api_base}/api/v1/device/{selected_machine}/{selected_device}/alert-mode/0",
+                method="POST",
+            )
+            if mode_err:
+                st.error(f"Failed to switch mode: {mode_err}")
+            else:
+                st.success("Mode switched to Mode 0 (SW420 Basic)")
+                st.rerun()
+        st.caption(mode_descriptions[0])
+    
+    with mode_cols[1]:
+        if st.button(mode_labels[1], use_container_width=True, type="primary" if current_mode == 1 else "secondary"):
+            mode_resp, mode_err = request_json(
+                f"{api_base}/api/v1/device/{selected_machine}/{selected_device}/alert-mode/1",
+                method="POST",
+            )
+            if mode_err:
+                st.error(f"Failed to switch mode: {mode_err}")
+            else:
+                st.success("Mode switched to Mode 1 (MPU Deviation)")
+                st.rerun()
+        st.caption(mode_descriptions[1])
+    
+    with mode_cols[2]:
+        if st.button(mode_labels[2], use_container_width=True, type="primary" if current_mode == 2 else "secondary"):
+            mode_resp, mode_err = request_json(
+                f"{api_base}/api/v1/device/{selected_machine}/{selected_device}/alert-mode/2",
+                method="POST",
+            )
+            if mode_err:
+                st.error(f"Failed to switch mode: {mode_err}")
+            else:
+                st.success("Mode switched to Mode 2 (Backend ML)")
+                st.rerun()
+        st.caption(mode_descriptions[2])
+    
+    st.markdown(f"<div style='margin-top:0.5rem; padding:0.5rem; background:#f0f0f0; border-radius:8px; color:#333;'><strong>🟢 Active Mode:</strong> {mode_labels[current_mode]} | Changes apply via Blynk V28 on next update</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
     left, right = st.columns([2.8, 1.2])
     with left:
         primary_labels = [LIVE_FIELD_META[field][0] for field in LIVE_PRIMARY_FIELDS]
