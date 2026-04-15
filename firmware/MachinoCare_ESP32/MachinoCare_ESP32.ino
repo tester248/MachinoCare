@@ -1409,6 +1409,27 @@ void reportBackendTelemetry() {
   Serial.println(",transport=http");
 }
 
+// Sync alert mode change to backend so dashboards reflect it immediately
+void syncAlertModeToBackend(int mode) {
+  if (!isNetworkReady() || activeBindingMachineId.length() == 0 || activeBindingDeviceId.length() == 0) {
+    return;
+  }
+  
+  String syncUrl = String(BACKEND_BASE_URL) + "/api/v1/device/" + 
+    activeBindingMachineId + "/" + activeBindingDeviceId + "/alert-mode-sync?alert_mode=" + String(mode);
+  
+  String response;
+  int code = 0;
+  
+  if (httpPostJson(syncUrl, "{}", response, 1000, &code, 1)) {
+    Serial.print("ALERT_MODE_SYNC,code=");
+    Serial.println(code);
+  } else {
+    Serial.print("ALERT_MODE_SYNC_FAILED,code=");
+    Serial.println(code);
+  }
+}
+
 // -------------------- Blynk handlers --------------------
 
 // V8: calibration trigger
@@ -1575,6 +1596,9 @@ BLYNK_WRITE(V28) {
   if (Blynk.connected()) {
     Blynk.virtualWrite(V26, "MODE=" + String(alertModeLabel()));
   }
+
+  // Sync the mode change to the backend so dashboards reflect it immediately
+  syncAlertModeToBackend(alertMode);
 }
 
 // -------------------- Main tasks --------------------
