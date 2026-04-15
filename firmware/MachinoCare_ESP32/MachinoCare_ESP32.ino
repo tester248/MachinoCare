@@ -48,7 +48,8 @@ const int daylightOffset_sec = 0;
 const int SW420_PIN = 34;
 const int RELAY_MOTOR_PIN = 25;
 const int RELAY_FAN_PIN = 26;
-const int LED_PIN = 27;
+const int green = 27;
+const int red = 14;
 const int BUZZER_PIN = 33;
 
 // Relay polarity (active LOW module)
@@ -432,8 +433,9 @@ void updateAlertOutputs() {
 
   digitalWrite(RELAY_MOTOR_PIN, motorRelayState);
   digitalWrite(RELAY_FAN_PIN, fanOn ? RELAY_ON : RELAY_OFF);
-  digitalWrite(LED_PIN, ledState ? LED_ON : LED_OFF);
+  digitalWrite(green, ledState ? LED_ON : LED_OFF);
   digitalWrite(BUZZER_PIN, buzzerState ? BUZZER_ON : BUZZER_OFF);
+  digitalWrite(red, buzzerState ? LED_ON : LED_OFF);
 }
 
 void ensureWiFiConnection() {
@@ -1831,7 +1833,8 @@ void setup() {
   pinMode(RELAY_MOTOR_PIN, OUTPUT);
   pinMode(RELAY_FAN_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(red, OUTPUT);
+  pinMode(green, OUTPUT);
 
   // Keep high-current outputs OFF on boot to avoid brownout/power resets.
   motorOn = false;
