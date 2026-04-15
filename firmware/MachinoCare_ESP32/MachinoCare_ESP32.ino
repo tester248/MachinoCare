@@ -1411,7 +1411,7 @@ void reportBackendTelemetry() {
 
 // Sync alert mode change to backend so dashboards reflect it immediately
 void syncAlertModeToBackend(int mode) {
-  if (!isNetworkReady() || activeBindingMachineId.length() == 0 || activeBindingDeviceId.length() == 0) {
+  if (!Blynk.connected() || activeBindingMachineId.length() == 0 || activeBindingDeviceId.length() == 0) {
     return;
   }
   
