@@ -1559,6 +1559,46 @@ def get_model_for_machine_device(machine_id: str, device_id: str) -> dict[str, A
     }
 
 
+@router.post("/device/{machine_id}/{device_id}/alert-mode/{mode_num}")
+def set_alert_mode(machine_id: str, device_id: str, mode_num: int) -> dict[str, Any]:
+    """Set the alert detection mode for a device.
+    
+    Mode 0: SW420 basic vibration detection
+    Mode 1: MPU acceleration/gyro deviation from baseline
+    Mode 2: Backend ML anomaly detection
+    
+    Note: The device must have an active Blynk connection to receive the mode change via V28.
+    """
+    if mode_num < 0 or mode_num > 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid mode_num. Must be 0 (SW420), 1 (MPU), or 2 (Backend ML).",
+        )
+    
+    state = store.get_machine_state(machine_id, device_id)
+    if not state:
+        # If state doesn't exist yet, create a new one
+        state = {
+            "machine_id": machine_id,
+            "device_id": device_id,
+        }
+    
+    # Update the alert_mode in the state
+    state["alert_mode"] = mode_num
+    store.set_machine_state(machine_id, device_id, state)
+    
+    mode_labels = {0: "SW420 Basic", 1: "MPU Deviation", 2: "Backend ML"}
+    return {
+        "status": "success",
+        "machine_id": machine_id,
+        "device_id": device_id,
+        "alert_mode": mode_num,
+        "alert_mode_label": mode_labels.get(mode_num, "Unknown"),
+        "message": f"Alert mode set to Mode {mode_num} ({mode_labels.get(mode_num)}). "
+                   f"Changes will apply via Blynk V28 on next update.",
+    }
+
+
 def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
     state = store.get_machine_state(machine_id, device_id)
     latest_sample = store.get_latest_sample_for_device(machine_id=machine_id, device_id=device_id)
@@ -1591,6 +1631,7 @@ def get_status_for_device(machine_id: str, device_id: str) -> dict[str, Any]:
         "esp_model_checksum": state.get("esp_model_checksum"),
         "status_label": state.get("status_label", "UNKNOWN"),
         "is_anomaly": state.get("is_anomaly", False),
+        "alert_mode": state.get("alert_mode", 0) if state else 0,
         "current": {
             "acc_mag": state.get("current_acc_mag"),
             "gyro_mag": state.get("current_gyro_mag"),

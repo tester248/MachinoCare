@@ -111,6 +111,25 @@ def get_debug_dashboard_html() -> str:
       border-color: #0c4179;
     }
 
+    .mode-btn {
+      background: #f8fafc;
+      border: 2px solid #cbd5e1;
+      color: var(--ink);
+      transition: all 0.2s ease;
+    }
+
+    .mode-btn:hover {
+      background: #f1f5f9;
+      border-color: #94a3b8;
+    }
+
+    .mode-btn.active {
+      background: linear-gradient(180deg, #15803d, #128e3e);
+      color: #fff;
+      border-color: #16a34a;
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.1);
+    }
+
     .pill {
       display: inline-block;
       border-radius: 999px;
@@ -210,6 +229,29 @@ def get_debug_dashboard_html() -> str:
           <div class="m"><div class="k">Band</div><div class="v" id="healthBand">n/a</div></div>
           <div class="m"><div class="k">Calibration</div><div class="v" id="calibVal">idle</div></div>
         </div>
+      </section>
+
+      <section class="card status">
+        <h3 style="margin:0 0 0.6rem;">📡 Detection Mode</h3>
+        <div class="row" style="gap: 0.5rem; margin-bottom: 0.6rem;">
+          <button id="modeBtn0" class="mode-btn" data-mode="0" style="flex:1; padding:0.5rem 0.8rem; font-size:0.9rem; border-radius:8px;">
+            <span style="display:block; font-size:0.75rem; opacity:0.7;">Mode 0</span>
+            <span style="display:block; font-weight:700;">SW420 Basic</span>
+          </button>
+          <button id="modeBtn1" class="mode-btn" data-mode="1" style="flex:1; padding:0.5rem 0.8rem; font-size:0.9rem; border-radius:8px;">
+            <span style="display:block; font-size:0.75rem; opacity:0.7;">Mode 1</span>
+            <span style="display:block; font-weight:700;">MPU Deviation</span>
+          </button>
+          <button id="modeBtn2" class="mode-btn" data-mode="2" style="flex:1; padding:0.5rem 0.8rem; font-size:0.9rem; border-radius:8px;">
+            <span style="display:block; font-size:0.75rem; opacity:0.7;">Mode 2</span>
+            <span style="display:block; font-weight:700;">Backend ML</span>
+          </button>
+        </div>
+        <div style="background:#f0fdf4; border:1px solid #86efac; border-radius:8px; padding:0.5rem; color:#15803d; font-size:0.8rem;">
+          <span style="display:inline-block; margin-right:0.5rem;">🟢</span>
+          <strong>Active Mode:</strong> <span id="activeModeIndicator">Unknown</span>
+        </div>
+        <div class="hint" style="margin-top:0.4rem;">Mode change applies via Blynk V28 (requires active device profile)</div>
       </section>
 
       <section class="card status">
@@ -808,6 +850,11 @@ def get_debug_dashboard_html() -> str:
         ? 'synced'
         : 'waiting';
       el('calibVal').textContent = `${stage} (${progress}%) | model ${espVersion}/${backendVersion} ${syncState}`;
+      
+      // Update active mode indicator if available
+      if (status.alert_mode != null) {
+        updateActiveModeIndicator(status.alert_mode);
+      }
     }
 
     function updateInsight(insight) {
@@ -993,6 +1040,17 @@ def get_debug_dashboard_html() -> str:
       }
     }
 
+    async function loadCurrentStatus(deviceName) {
+      try {
+        const response = await fetch(`/api/v1/status/${encodeURIComponent(deviceName)}`);
+        if (!response.ok) return;
+        const status = await response.json();
+        updateStatus(status);
+      } catch (err) {
+        console.warn('Failed to load current status:', err);
+      }
+    }
+
     function connectLive() {
       console.log('connectLive: starting...');
       const profile = currentProfile();
@@ -1068,6 +1126,7 @@ def get_debug_dashboard_html() -> str:
       const profile = currentProfile();
       if (profile) {
         const deviceName = String(profile.display_name || '').trim();
+        loadCurrentStatus(deviceName);
         loadInsights(deviceName);
       }
       if (ws) connectLive();
@@ -1310,6 +1369,57 @@ def get_debug_dashboard_html() -> str:
       setConnState('disconnected', 'warn');
     }
 
+    function updateActiveModeIndicator(modeNum) {
+      const modes = ['SW420 Basic', 'MPU Deviation', 'Backend ML'];
+      const modeLabel = modes[modeNum] || 'Unknown';
+      el('activeModeIndicator').textContent = `Mode ${modeNum} - ${modeLabel}`;
+      
+      // Update button styling
+      for (let i = 0; i < 3; i++) {
+        const btn = el(`modeBtn${i}`);
+        if (btn) {
+          if (i === modeNum) {
+            btn.classList.add('active');
+          } else {
+            btn.classList.remove('active');
+          }
+        }
+      }
+    }
+
+    async function switchMode(modeNum) {
+      const profile = currentProfile();
+      if (!profile) {
+        el('profileHint').textContent = 'Select a profile before changing detection mode.';
+        return;
+      }
+
+      const machineId = profile.machine_id;
+      const deviceId = profile.device_id;
+      const displayName = String(profile.display_name || '').trim();
+      
+      el('profileHint').textContent = `Switching to Mode ${modeNum}...`;
+      
+      try {
+        const response = await fetch(
+          `/api/v1/device/${encodeURIComponent(machineId)}/${encodeURIComponent(deviceId)}/alert-mode/${modeNum}`,
+          { method: 'POST' }
+        );
+        
+        if (!response.ok) {
+          const text = await response.text();
+          el('profileHint').textContent = `Mode switch failed: ${text}`;
+          return;
+        }
+
+        updateActiveModeIndicator(modeNum);
+        el('profileHint').textContent = `✓ Detection mode switched to Mode ${modeNum}. Changes apply via Blynk V28.`;
+      } catch (err) {
+        console.error('Mode switch error:', err);
+        el('profileHint').textContent = `Error switching mode: ${err.message}`;
+      }
+    }
+
     async function init() {
       renderFieldControls();
       renderChart();
@@ -1345,6 +1455,14 @@ def get_debug_dashboard_html() -> str:
       el('deleteProfileBtn').addEventListener('click', deleteProfile);
       el('tsRefreshBtn').addEventListener('click', loadThingSpeakHistory);
       el('tsEnabled').addEventListener('change', loadThingSpeakHistory);
+
+      // Mode button listeners
+      for (let i = 0; i < 3; i++) {
+        const btn = el(`modeBtn${i}`);
+        if (btn) {
+          btn.addEventListener('click', () => switchMode(i));
+        }
+      }
 
       renderThingSpeakFieldControls();
       renderThingSpeakChart();
